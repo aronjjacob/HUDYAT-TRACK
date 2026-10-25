@@ -1,0 +1,61 @@
+fsl105_id,fsl105_label,category,sign_id
+0,GOOD MORNING,greetings,good_morning
+1,GOOD AFTERNOON,greetings,good_afternoon
+2,GOOD EVENING,greetings,good_evening
+3,HELLO,greetings,hello
+4,HOW ARE YOU,greetings,how_are_you
+5,IM FINE,greetings,im_fine
+6,NICE TO MEET YOU,greetings,nice_to_meet_you
+7,THANK YOU,greetings,thank_you
+8,YOURE WELCOME,greetings,youre_welcome
+9,SEE YOU TOMORROW,greetings,see_you_tomorrow
+20,ONE,numbers,one
+21,TWO,numbers,two
+22,THREE,numbers,three
+23,FOUR,numbers,four
+24,FIVE,numbers,five
+25,SIX,numbers,six
+26,SEVEN,numbers,seven
+27,EIGHT,numbers,eight
+28,NINE,numbers,nine
+29,TEN,numbers,ten
+30,JANUARY,calendar,january
+31,FEBRUARY,calendar,february
+32,MARCH,calendar,march
+33,APRIL,calendar,april
+34,MAY,calendar,may
+35,JUNE,calendar,june
+36,JULY,calendar,july
+37,AUGUST,calendar,august
+38,SEPTEMBER,calendar,september
+39,OCTOBER,calendar,october
+40,NOVEMBER,calendar,november
+41,DECEMBER,calendar,december
+42,MONDAY,calendar,monday
+43,TUESDAY,calendar,tuesday
+44,WEDNESDAY,calendar,wednesday
+45,THURSDAY,calendar,thursday
+46,FRIDAY,calendar,friday
+47,SATURDAY,calendar,saturday
+48,SUNDAY,calendar,sunday
+49,TODAY,calendar,today
+50,TOMORROW,calendar,tomorrow
+51,YESTERDAY,calendar,yesterday
+52,FATHER,family,father
+53,MOTHER,family,mother
+54,SON,family,son
+55,DAUGHTER,family,daughter
+56,GRANDFATHER,family,grandfather
+57,GRANDMOTHER,family,grandmother
+58,UNCLE,family,uncle
+59,AUNTIE,family,auntie
+60,COUSIN,family,cousin
+61,PARENTS,family,parents
+72,BLUE,colors,blue
+73,GREEN,colors,green
+74,RED,colors,red
+79,ORANGE,colors,orange
+78,YELLOW,colors,yellow
+82,VIOLET,colors,violet
+15,YES,word_concepts,yes
+14,NO,word_concepts,no

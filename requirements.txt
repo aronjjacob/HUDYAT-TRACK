@@ -1,0 +1,13 @@
+# HUDYAT Hand Tracker - pinned dependencies for Python 3.12 (64-bit) on Windows 10/11.
+# Tested together: mediapipe 0.10.21 requires numpy < 2 and pulls in opencv-contrib-python.
+# Do NOT also install "opencv-python": two OpenCV packages in one venv fight over the cv2 module.
+mediapipe==0.10.21
+opencv-contrib-python==4.11.0.86
+numpy==1.26.4
+# Smooth on-screen text and rounded UI shapes (hudyat_ui.py). Already pulled in by mediapipe; pinned here.
+pillow==12.3.0
+
+# import_public.py: bundled ffmpeg, used when ffmpeg is not installed on the system.
+imageio-ffmpeg==0.6.0
+# Unit tests in tests/ (python -m pytest).
+pytest==9.1.1

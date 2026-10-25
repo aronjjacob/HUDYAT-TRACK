@@ -1,0 +1,23 @@
+# Python environment and caches
+venv/
+__pycache__/
+.pytest_cache/
+debug.log
+
+# Data that stays on the laptop (large; videos show signers' faces)
+dataset/raw/
+dataset/landmarks/
+
+# Local tool settings and notes
+.claude/
+docs/
+
+# Per-laptop data and logs (the tool recreates these when missing)
+dataset/metadata.csv
+dataset/landmarks_index.csv
+dataset/landmarks_duplicate_handedness.log
+dataset/session_logs/
+settings.json
+
+# Expert-validation form work (separate from the recorder)
+validation/
