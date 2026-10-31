@@ -24,8 +24,9 @@ project that reads this folder's `dataset/`.
 | `settings.json` | Remembered camera index, camera name and backend (created on first run). |
 | `public_mapping.csv` | Which FSL-105 label becomes which of our signs: `fsl105_id, fsl105_label, category, sign_id`. |
 | `assets/fonts/` | Poppins font (SIL Open Font License, see `OFL.txt`) used for the on-screen text. |
-| `signs.csv` | The sign list (110 rows). |
-| `references/` | Expert reference videos, named `<sign_id>.mp4` (for the team and the experts; not shown in the recorder). |
+| `signs.csv` | The sign list (108 rows). |
+| `hudyat_reference.py` | Reference mode (section 3.8): sign order, file names, MP4/GIF export, manifest and Google Form material. |
+| `references/` | Reference videos for the FSL expert validation (section 3.8), made with `record_tool.py --reference`. |
 | `tests/` | Unit tests: `python -m pytest`. |
 | `requirements.txt` | Python packages. |
 
@@ -56,6 +57,10 @@ pip install -r requirements.txt
 :: 4. Download the MediaPipe hand model (about 7.5 MB) into models\
 if not exist models mkdir models
 curl.exe -L -o models\hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+
+:: 5. Download the MediaPipe face model (about 3.7 MB): used only in take review
+::    to check that the whole face is in the picture (section 3.4)
+curl.exe -L -o models\face_landmarker.task https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task
 ```
 
 Using **PowerShell** instead? Steps 1, 3 and 4 are the same (use
@@ -75,6 +80,12 @@ this SHA-256:
 
 ```
 fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1
+```
+
+The face model used during development (`face_landmarker.task`, 2026-10-27):
+
+```
+64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff
 ```
 
 Check a copy with `certutil -hashfile models\hand_landmarker.task SHA256`. The
@@ -135,6 +146,7 @@ look before pressing SPACE.
 - [ ] **Front lighting**: lights behind or beside the camera, facing the signer. No window behind the signer.
 - [ ] Brightness indicator says **OK** (not TOO DARK / TOO BRIGHT).
 - [ ] Framing guides: **top of head** near the top corner brackets, **waist** near the bottom brackets, body centered between the small center ticks. Hands must stay inside the frame while signing.
+- [ ] The **whole face**, from the forehead to the chin, is inside the picture. Many signs differ only in where the hand is (Father at the forehead, Mother at the chin), and the training data measures the hands against the face (section 6.7). A cut-off forehead makes those signs impossible to tell apart.
 - [ ] Raise your right hand: the preview labels it **Right**; then the left hand: **Left**.
 - [ ] **Hands-down rule explained to the signer:** every take starts and ends with **both hands down, resting below the camera view** (on the lap), like the FSL-105 signer. Raise the hands only after "REC" appears, sign once, then lower them out of view before the 3 seconds end. Check it: with the hands resting, the `check_camera.py` preview shows **Hands detected: 0**. Extraction cuts each clip to the part where hands are visible (section 6.4), so idle frames at both ends are needed.
 - [ ] Signer wears plain, long sleeves that are **not green**, with no rings, bracelets or watch.
@@ -184,7 +196,7 @@ Signers are **S1–S7**. Each signer records with their natural dominant hand
 is never recorded with this tool; it comes from `import_public.py`.
 
 Targets per signer (shown as progress everywhere): **15 takes** for each of
-each of the 110 signs: the 84 word signs and the 26 letters A–Z (category
+each of the 108 signs: the 82 word signs and the 26 letters A–Z (category
 `alphabet`, sign ids `letter_a` … `letter_z`). Every signer records every
 category: 1,650 clips per signer.
 
@@ -226,7 +238,7 @@ controls on top:
 |---|---|
 | Top-left | **Back** button (Esc) → sign list, and the breadcrumbs. Under them: the **sign name** in big letters, a blue progress bar of kept takes for this sign, and pills for **Signer** (click to switch signer), **Take X / N** and **Hands: 1 or 2**. The Hands dot turns **green** when the required number of hands is detected. A yellow pill appears if the scene is too dark or too bright. |
 | Top-right | **Category** pill (click to open the category grid) and the **guides** button (G). Under them: the clickable list of the category's signs (✓ green = complete, blue = current, dim = still to do). Click any sign to jump to it. Long lists scroll with the mouse wheel or the small ⌃/⌄ buttons. |
-| Middle | Thin **corner brackets** mark the head-to-waist area (G hides them). Only **hand** landmarks are drawn (red, on both hands). No face model runs at all. |
+| Middle | Thin **corner brackets** mark the head-to-waist area (G hides them). Only **hand** landmarks are drawn (red, on both hands). No face model runs on the live view; one runs only in take review (section 3.4), and nothing about the face is saved. |
 | Bottom-left | **Record** (Space), **Skip** (S) and **Pause** (P) buttons, and below them the real camera resolution / fps plus clips kept this session. |
 | Bottom | A **caption** says what to do next ("Press SPACE to record", "Recording…", "Keep or retake?"). Messages and camera warnings appear just above it. |
 | Bottom-right | The blue **Keep (K)** and round **Retake (R)** buttons, active only during review. |
@@ -245,11 +257,13 @@ take is recording or waiting for Keep / Retake.** Finish it (K) or discard it
 3. **Take review**: the clip replays in the main view with the hand landmarks, and a **Take quality** card shows:
    - **Hand detection** (`hand_detect_rate`): % of frames with at least one hand, measured **inside the sign window** (the part extraction keeps, section 6.4), so the hands-down frames at both ends don't lower it;
    - **Both hands** (`both_hands_rate`): % of sign-window frames with two hands (highlighted for 2-hand signs);
+   - **Face visible**: % of the hands-down frames (no hand in the picture) where the whole face, forehead to chin, is inside the picture. Only those frames are checked, because a hand in front of the face during the sign is normal. "not checked" if the face model is missing (Setup step 5) or no frame was hands-down. The face points are used for this check only and are not saved;
    - **Sign window**: how long the kept part is, in seconds;
    - **Duration**: the real duration of the whole take in seconds.
 4. Yellow warning pills suggest a retake when:
    - `hand_detect_rate < 80%`, or, for 2-hand signs, `both_hands_rate < 80%`;
    - **"Hand visible at the start / end. Start and end with hands down."** A hand was detected in the first or last **0.3 s** of the take. Retake it, because the trim needs idle frames at both ends.
+   - **"Face not fully visible"**: Face visible < 80%. Move the camera or the signer so the forehead and chin are in the picture, then retake.
 
    Nothing is ever deleted automatically; the operator decides.
 5. Press **K** to keep or **R** to retake (or click the buttons).
@@ -308,7 +322,69 @@ replay it, and click **Flag: needs re-record**.
 - `hand_detect_rate` and `both_hands_rate` are fractions from 0 to 1 (`0.950` = 95%).
 - `orientation` is always `camera_raw_unmirrored` (see section 6).
 
-### 3.8 After recording
+### 3.8 Reference videos (for the FSL expert validation)
+
+Before the signers record their takes, anyone who knows the signs records **one
+reference video per sign (all 108)**. The FSL validators check them in a
+Google Form.
+
+```powershell
+python record_tool.py --reference            # or the "Reference videos" button on the dashboard
+python record_tool.py --reference --ref-seconds 5
+```
+
+1. Click **Left hand** or **Right hand** (or press L / R) to start. No name
+   is asked; the hand is remembered and saved in the manifest.
+2. Like the dashboard, you first see one tile per category (`01 Alphabet` …
+   `09 Word Concepts`) with its count (`3 / 10`) and a green tick when it is
+   complete; the total (`37 / 108`) is under the title. Click a category to
+   see its signs, each **done** or **pending**, and click a sign to record
+   it. A blue outline marks the last category and sign used, and it is
+   remembered for next time. On the recording screen the list on the right
+   shows only that category; N / B carry on into the next or previous one.
+3. **SPACE** records one take: the same countdown, mirrored preview and Hands
+   indicator as normal recording, **4 seconds** long (`--ref-seconds`).
+   Hands down at the start and end, as usual.
+4. The take replays at once: **K** keep, **R** redo, **N** next sign, **B**
+   previous sign. A yellow warning appears if hands were found in less than
+   80% of the sign window; keeping is still allowed.
+5. Recording a **done** sign again moves the old files to `references\_old\`
+   (with a timestamp) when the new take is kept. Nothing is deleted.
+6. **Second version.** If a sign has another way of signing it, press **V**
+   on a done sign to record it as version 2 (`<NN> <Sign Label> (2).mp4` /
+   `.gif`, next to version 1, which is not touched). Only two versions per
+   sign; pressing V again replaces version 2 (the old one goes to `_old`). In
+   the form, such a sign shows both GIFs and asks one question, **"Which
+   version is correct?"** (Version 1 / Version 2 / Neither is correct; the
+   validator can tick more than one). `manifest.csv` has one row per video
+   with a `version` column.
+
+Only signs **with** a reference video are validated in the form. Signs
+without one (for example when no reliable reference could be found) go on a
+last page, **"Help us with N more signs"**: the validators tick which of them
+they know and can send a video of them on Messenger or to a Google Drive
+upload folder (`UPLOAD_LINK` in the script, see `FORM_SETUP.md`). Record the
+videos they send in reference mode like the others.
+
+For each kept take, in `references\validation\<NN Category>\`:
+
+- `<NN> <Sign Label>.mp4`: H.264 (yuv420p), 1280×720, no audio, trimmed to
+  the sign window (section 6.4) plus 0.3 s on each side. **Not mirrored**: it
+  shows the signer as the camera sees them, like a person face to face.
+- `<NN> <Sign Label>.gif`: the same clip, 480 px wide, 12 fps, looping. If it
+  is 2 MB or more, the tool steps down (480/10, 400/10, 360/8, 320/8, 240/6
+  px/fps) until it fits; the setting used is in the manifest (`gif_settings`)
+  and the log.
+
+The label is exactly `sign_label` from `signs.csv` (`06 I'm Fine`); only
+characters Windows forbids are replaced. After every kept take the tool also
+rewrites, in `references\validation\`: `manifest.csv`, `form_list.md`,
+`build_validation_form.gs` (Google Apps Script that builds the form) and
+`FORM_SETUP.md` (how to upload the folder and run the script). To write them
+at any time without the camera: `python hudyat_reference.py`. Log:
+`references\reference_log.txt`. Reference mode never writes to `dataset\`.
+
+### 3.9 After recording
 
 Landmark extraction, splitting and training are done by the separate
 preprocessing/training project, which reads `dataset/raw/` and
@@ -336,10 +412,14 @@ HUDYAT - HAND TRACKER/
 ├── README.md
 ├── tests/                     unit tests (python -m pytest)
 ├── models/
-│   └── hand_landmarker.task   MediaPipe model (downloaded at setup)
+│   ├── hand_landmarker.task   MediaPipe hand model (downloaded at setup)
+│   └── face_landmarker.task   MediaPipe face model (downloaded at setup; take review only)
+├── hudyat_reference.py        reference videos + validation form material
 ├── references/
 │   ├── README.txt
-│   └── <sign_id>.mp4          expert reference clips (optional, not shown in the recorder)
+│   ├── validation/            <NN Category>/<NN> <Sign Label>.mp4/.gif, manifest.csv, form files
+│   ├── _old/                  earlier versions of re-recorded reference videos
+│   └── reference_log.txt
 ├── venv/                      Python environment (created at setup)
 └── dataset/
     ├── metadata.csv           one row per KEPT clip (recorded and imported)
@@ -392,7 +472,7 @@ clip always go into the same part as the original clip, and clips with
 | Container / codec | MP4 / `mp4v` (fallback AVI / `XVID`) |
 | Saved orientation | **unmirrored** (as the camera sees it) |
 | Low-fps warning | below 25 fps (a warning only; it never blocks recording) |
-| Retake warning | hand detection < 80% (2-hand signs: both hands < 80%) |
+| Retake warning | hand detection < 80% (2-hand signs: both hands < 80%); whole face visible in < 80% of the hands-down frames |
 
 All of these are constants at the top of `hudyat_common.py` (shared) or of
 each script (script-specific), so the team can change them in one place.
@@ -449,7 +529,7 @@ from this folder.)
 **Never** draw a flipped frame into a canvas and run detection on that. Use
 `handedness[i][0].categoryName` as-is.
 
-### 6.2 Per-frame vector: 128 float values
+### 6.2 Per-frame vector: 141 float values
 
 | Index | Content |
 |---|---|
@@ -457,6 +537,14 @@ from this folder.)
 | 63 | Left present flag (`1.0` / `0.0`) |
 | 64 – 126 | **Right** hand: same 63-value layout |
 | 127 | Right present flag |
+| 128 – 133 | **Left** hand location against the face (6.7): `wrist x, y, thumb tip x, y, index tip x, y` |
+| 134 – 139 | **Right** hand location: same 6-value layout |
+| 140 | Face present flag (`1.0` / `0.0`) |
+
+Values 0–127 say **what shape** each hand makes (6.3 removes where the hand
+is). Values 128–140 say **where** each hand is compared with the face, which
+is the only difference between signs like Father (forehead) and Mother
+(chin).
 
 - Hands go into slots by **handedness label**, never by detection order.
 - A missing hand is 63 zeros with its flag set to 0.
@@ -556,8 +644,12 @@ sampled uniformly over time:
     `(1 - w) * v[i0] + w * v[i1]` of the 63 values;
   - otherwise, copy the **nearest** frame's 63 values (and its flag). A
     present hand is never blended with the zeros of an absent hand.
+- A hand's **6 location values** (6.7) follow the same rule, except that
+  they are interpolated only if the hand **and the face** are present in
+  both `i0` and `i1`; otherwise the nearest frame's 6 values are copied.
+- **Face flag** = the flag of the nearest original frame.
 
-Saved sample: `.npy`, shape **(32, 128)**, dtype **float32**.
+Saved sample: `.npy`, shape **(32, 141)**, dtype **float32**.
 
 ### 6.6 Live app rule (browser)
 
@@ -571,7 +663,7 @@ The learner does not press a button, so the app finds the sign window itself:
    **or after a maximum of 3 seconds**, whichever comes first. The 3-second
    limit means recognition still works when a learner keeps their hands in
    view. Then a new window can start straight away.
-3. Build the 128-value vector for every frame in the window (6.2, 6.3), apply
+3. Build the 141-value vector for every frame in the window (6.2, 6.3, 6.7), apply
    `signWindow` (6.4), resample to 32 (6.5) and run the model.
 
 Recommended (not required) for robustness: treat "disappear" as "no hand for
@@ -582,6 +674,58 @@ sign in half. The trailing absent frames are removed again by the 6.4 trim
 Training clips match this: FSL-105 signs are 1.1–2.0 s long (90 % of
 clips), so they fit inside the 3-second limit, and our 3-second takes can
 never be longer than it.
+
+### 6.7 Hand location against the face (values 128–140)
+
+6.3 moves every hand to the origin, so on its own the vector cannot tell
+apart two signs with the same hand shape made at different places (Father at
+the forehead, Mother at the chin; Grandfather / Grandmother; and any other
+such pair in any category). These 13 values add the location back, for
+**every sign**. Where location does not matter (most letters and numbers),
+the model learns to ignore them.
+
+1. Run the MediaPipe **FaceLandmarker** (`runningMode: VIDEO`, `numFaces: 1`,
+   `models\face_landmarker.task`, Setup step 5) on the **same unmirrored
+   frames** as the hand model.
+2. Take three face landmarks and aspect-correct their `x` like 6.3 step 1
+   (`x *= W/H`): **nose tip** `N` = landmark 1, **forehead** `F` = landmark 10,
+   **chin** `C` = landmark 152.
+3. **Face size** `s` = 2D distance from `F` to `C`. If no face was found, or
+   `s < 1e-6`: face flag = 0 and all 12 location values are 0.
+4. Otherwise face flag = 1, and for each **present** hand, from its raw
+   (aspect-corrected, not 6.3-normalized) landmarks, take the **wrist** (0),
+   **thumb tip** (4) and **index tip** (8). Each point gives
+   `((x − N.x) / s, (y − N.y) / s)`: where it is, measured from the nose, in
+   face sizes. `y` grows downwards, so the forehead is negative and the chin
+   positive. An absent hand gets 6 zeros.
+5. No `z`: depth from a single camera is too noisy to be useful here.
+
+Because the values are divided by the face size, they do not change when the
+signer sits closer to or farther from the camera. The recorder checks that the
+whole face is in the picture during take review (section 3.4). The sign
+window (6.4) still uses hand presence only.
+
+```js
+// Browser reference implementation. face = 478 {x,y,z} or null; hands = {Left, Right} raw landmarks or null.
+function locationFeatures(face, hands, W, H) {
+  const a = W / H, out = new Array(13).fill(0);
+  if (!face) return out;
+  const P = i => [face[i].x * a, face[i].y];
+  const [N, F, C] = [P(1), P(10), P(152)];
+  const s = Math.hypot(F[0] - C[0], F[1] - C[1]);
+  if (s < 1e-6) return out;
+  ['Left', 'Right'].forEach((side, h) => {
+    const lm = hands[side];
+    if (!lm) return;
+    [0, 4, 8].forEach((k, j) => {
+      out[h * 6 + j * 2] = (lm[k].x * a - N[0]) / s;
+      out[h * 6 + j * 2 + 1] = (lm[k].y - N[1]) / s;
+    });
+  });
+  out[12] = 1;
+  return out;                                    // goes to vector[128..140]
+}
+```
 
 ---
 
@@ -610,6 +754,8 @@ never be longer than it.
 | **Video won't play** in the Windows player | `mp4v` files don't play in every default player. Install **VLC** (free) and open the files with it. The files themselves are fine. |
 | `.avi` files instead of `.mp4` | The `mp4v` codec wasn't available, so the tool fell back to XVID (logged in the `codec` column). VLC plays both, and OpenCV reads both. |
 | "MediaPipe model not found" | Do Setup step 4 (download `models\hand_landmarker.task`). |
+| "Face check skipped" in take review | Do Setup step 5 (download `models\face_landmarker.task`). Recording still works without it. |
+| "Face not fully visible" | The forehead or chin is outside the picture while the hands are down. Tilt the camera up a little or move the signer back, until the framing guides show the top of the head inside the top brackets. |
 | `'python' is not recognized` / wrong Python | Activate the venv first (`venv\Scripts\activate.bat`). The prompt should start with `(venv)`. |
 | Keys do nothing | Click on the video window so it has keyboard focus. |
 | A button/sign "does nothing" on the recording screen | A take is recording or waiting for Keep / Retake; the message above the caption says so. Press K or R first. |
@@ -689,6 +835,9 @@ package.
 
 ### Step 3: Expert validation (manual)
 
+The sign forms themselves are validated first, before the 15 takes, with the
+reference videos and the Google Form (section 3.8).
+
 The FSL experts review the clips (Saved takes → replay in the recorder, or
 VLC). Bad takes: flag them **Needs re-record** in the recorder (section 3.6)
 and record new ones. Clips the experts reject outright (e.g. PUB clips): add a
@@ -702,5 +851,7 @@ first) and write `rejected` (or `approved`) in it. Also set `hands = 2` and
 python -m pytest
 ```
 
-Unit tests for the time-based recording, the sign-window rule (section 6.4)
-and the public-dataset import plan.
+Unit tests for the time-based recording, the sign-window rule (section 6.4),
+the public-dataset import plan, and Reference mode (sign order, file names,
+archiving, manifest, GIF size limit, the generated form script, and a
+record → keep run on a synthetic video without a webcam).

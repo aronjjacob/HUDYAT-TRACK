@@ -32,6 +32,7 @@ from mediapipe.tasks.python import BaseOptions, vision
 # =============================================================================
 PROJECT_DIR = Path(__file__).resolve().parent
 MODEL_PATH = PROJECT_DIR / "models" / "hand_landmarker.task"
+FACE_MODEL_PATH = PROJECT_DIR / "models" / "face_landmarker.task"   # take review only: is the face in the picture?
 SIGNS_CSV = PROJECT_DIR / "signs.csv"
 REFERENCES_DIR = PROJECT_DIR / "references"
 DATASET_DIR = PROJECT_DIR / "dataset"
@@ -173,6 +174,10 @@ def hands_at_edges(hand_present: "np.ndarray | list[bool]", fps: float,
 # whole clip, because signers start and end each take with their hands down.
 HAND_DETECT_WARN_RATE = 0.80     # warn if < 80 % of sign-window frames contain a hand
 BOTH_HANDS_WARN_RATE = 0.80      # for 2-hand signs: warn if < 80 % of sign-window frames have 2 hands
+# The face (forehead to chin) must be in the picture: location features (README 6.7)
+# measure the hands against it. Checked on the hands-down frames only, because a
+# hand in front of the face during the sign is normal.
+FACE_VISIBLE_WARN_RATE = 0.80    # warn if the whole face is visible in < 80 % of the hands-down frames
 
 # Mean grayscale brightness (0-255) of the frame.
 BRIGHTNESS_TOO_DARK = 70
@@ -306,6 +311,36 @@ def detect_hands(landmarker: vision.HandLandmarker, frame_bgr: np.ndarray,
             landmarks=np.array([[p.x, p.y, p.z] for p in lms], dtype=np.float32),
         ))
     return hands
+
+
+def create_face_landmarker() -> vision.FaceLandmarker | None:
+    """A FaceLandmarker in VIDEO running mode, or None if the model is not downloaded."""
+    if not FACE_MODEL_PATH.exists():
+        return None
+    options = vision.FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(FACE_MODEL_PATH)),
+        running_mode=vision.RunningMode.VIDEO,
+        num_faces=1,
+    )
+    return vision.FaceLandmarker.create_from_options(options)
+
+
+def face_inside_frame(points: np.ndarray) -> bool:
+    """True if a face was found and all its landmarks (forehead to chin, ear to
+    ear) lie inside the image. points: (N, 3) normalised x, y, z; N = 0 if no face."""
+    if len(points) == 0:
+        return False
+    xy = points[:, :2]
+    return bool((xy >= 0.0).all() and (xy <= 1.0).all())
+
+
+def face_fully_visible(landmarker: vision.FaceLandmarker, frame_bgr: np.ndarray, timestamp_ms: int) -> bool:
+    """Run the face model on one UNMIRRORED BGR frame. Nothing is stored."""
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    result = landmarker.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), int(timestamp_ms))
+    if not result.face_landmarks:
+        return False
+    return face_inside_frame(np.array([[p.x, p.y, p.z] for p in result.face_landmarks[0]], dtype=np.float32))
 
 
 # =============================================================================

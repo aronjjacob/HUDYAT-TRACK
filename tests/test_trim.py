@@ -87,3 +87,56 @@ def test_hand_visible_at_start_or_end_warns_hands_down():
     q = rt.take_quality(counts(90, 20, 89), 30.0, SHAPES, 90, 30.0)
     assert any("Start and end with hands down" in w and "end" in w for w in q.warnings)
 
+
+
+# --- face fully visible (checked on the hands-down frames only) ---------------
+def face_flags(hand_counts, visible):
+    """Face result per frame: None where a hand is in the picture (not checked)."""
+    return [None if c else visible for c in hand_counts]
+
+
+def test_face_visible_on_hands_down_frames_is_quiet():
+    c = counts(90, 20, 60)
+    q = rt.take_quality(c, 30.0, SHAPES, 90, 30.0, face_visible=face_flags(c, True))
+    assert q.face_visible_rate == 1.0 and q.warnings == []
+
+
+def test_face_cut_off_warns():
+    c = counts(90, 20, 60)
+    q = rt.take_quality(c, 30.0, SHAPES, 90, 30.0, face_visible=face_flags(c, False))
+    assert q.face_visible_rate == 0.0
+    assert any("Face not fully visible" in w for w in q.warnings)
+
+
+def test_face_rate_ignores_frames_where_a_hand_covers_the_face():
+    c = counts(90, 20, 60)
+    flags = face_flags(c, True)
+    for i in range(0, 10):                                 # 10 of the 49 hands-down frames cut off
+        flags[i] = False
+    q = rt.take_quality(c, 30.0, SHAPES, 90, 30.0, face_visible=flags)
+    assert q.face_visible_rate == pytest.approx(39 / 49)
+    assert any("Face not fully visible (80%)" in w for w in q.warnings)
+
+
+def test_no_face_check_when_model_is_missing_or_no_hands_down_frames():
+    c = counts(90, 20, 60)
+    assert rt.take_quality(c, 30.0, SHAPES, 90, 30.0).face_visible_rate is None
+    q = rt.take_quality(c, 30.0, SHAPES, 90, 30.0, face_visible=[None] * 90)
+    assert q.face_visible_rate is None and not any("Face" in w for w in q.warnings)
+
+
+def test_face_inside_frame():
+    inside = np.array([[0.4, 0.2, 0.0], [0.6, 0.5, 0.0]], np.float32)
+    assert hc.face_inside_frame(inside)
+    assert not hc.face_inside_frame(inside - [0.0, 0.25, 0.0])   # forehead above the top edge
+    assert not hc.face_inside_frame(inside + [0.5, 0.0, 0.0])    # off the right edge
+    assert not hc.face_inside_frame(np.zeros((0, 3), np.float32))  # no face found
+
+
+@pytest.mark.skipif(not hc.FACE_MODEL_PATH.exists(), reason="MediaPipe face model not downloaded")
+def test_face_landmarker_finds_no_face_in_a_blank_frame():
+    lm = hc.create_face_landmarker()
+    try:
+        assert hc.face_fully_visible(lm, np.full((720, 1280, 3), 90, np.uint8), 0) is False
+    finally:
+        lm.close()

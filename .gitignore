@@ -21,3 +21,7 @@ settings.json
 
 # Expert-validation form work (separate from the recorder)
 validation/
+
+# Reference videos and generated form material (videos show the demonstrator's face)
+references/*
+!references/README.txt

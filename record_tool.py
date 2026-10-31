@@ -17,6 +17,13 @@ Optional command-line shortcuts:
     --hand left|right   sets the signer's hand in signers.csv
     python record_tool.py --list-cameras [--backend dshow]
         prints every camera index with its resolution and measured fps, then exits
+    python record_tool.py --reference [--ref-seconds 4]
+        Reference mode (also the "Reference videos" button on the dashboard):
+        one 4-second reference take per sign (all 108) for the FSL expert
+        validation form. Saved under references/ (see hudyat_reference.py);
+        dataset/ is never touched. Review keys: K keep, R redo, N next, B previous.
+        V on a done sign records a second version (another way of signing it):
+        "<NN> <Sign Label> (2).mp4"; the form then asks which version is correct.
 
 Keys on the recording screen (click the window first so it has keyboard focus):
     SPACE = start the 3-2-1 countdown and record one take
@@ -65,6 +72,7 @@ import cv2
 import numpy as np
 
 import hudyat_common as hc
+import hudyat_reference as ref
 import hudyat_store as store
 import hudyat_ui as ui
 
@@ -92,6 +100,7 @@ CARD_W = 330                       # take-quality card
 KEEP_W, KEEP_H = 196, 58           # Keep button (the retake button is KEEP_H round)
 REC_BAR_W = 320                    # recording progress bar
 TOAST_SECONDS = 4.0                # how long a status message stays visible
+REF_SIGN_COLS = 3                  # reference videos: signs per row in a category
 
 METADATA_FIELDS = store.METADATA_FIELDS
 
@@ -343,20 +352,27 @@ class ClipReview:
     window_start: int = 0        # sign window kept by the trim (frame indexes, end inclusive)
     window_end: int = 0
     fps: float = float(hc.TARGET_FPS)
+    face_visible_rate: float | None = None   # 0..1 over the hands-down frames; None = not checked
 
 
-def analyze_clip(path: Path, sign: hc.Sign, fps_actual: float, expected_frames: int) -> ClipReview:
+def analyze_clip(path: Path, sign: hc.Sign, fps_actual: float, expected_frames: int,
+                 clip_seconds: float = hc.CLIP_SECONDS) -> ClipReview:
     """Re-open the SAVED file (proves it is readable), run MediaPipe on every
     full-resolution frame and compute the quality numbers.
 
     Uses a fresh VIDEO-mode HandLandmarker and unmirrored frames, the same way
     extract_landmarks.py does, so the numbers match the later extraction.
+
+    On the frames without a hand, a face model checks that the whole face is in
+    the picture (nothing about the face is saved).
     """
     cap = cv2.VideoCapture(str(path))
     file_fps = cap.get(cv2.CAP_PROP_FPS) or hc.TARGET_FPS
     landmarker = hc.create_hand_landmarker()
+    face_landmarker = hc.create_face_landmarker()          # None if the model is not downloaded
     frames: list[np.ndarray] = []
     hands_per_frame: list[list[hc.DetectedHand]] = []
+    face_visible: list[bool | None] = []
     n = 0
     brightness_sum = 0.0
     try:
@@ -364,7 +380,10 @@ def analyze_clip(path: Path, sign: hc.Sign, fps_actual: float, expected_frames: 
             ok, frame = cap.read()
             if not ok:
                 break
-            hands = hc.detect_hands(landmarker, frame, round(n * 1000 / file_fps))
+            ts = round(n * 1000 / file_fps)
+            hands = hc.detect_hands(landmarker, frame, ts)
+            face_visible.append(hc.face_fully_visible(face_landmarker, frame, ts)
+                                if face_landmarker is not None and not hands else None)
             n += 1
             brightness_sum += hc.mean_brightness(frame)
             display = cv2.flip(frame, 1)                       # mirrored COPY, for replay only
@@ -374,10 +393,16 @@ def analyze_clip(path: Path, sign: hc.Sign, fps_actual: float, expected_frames: 
     finally:
         cap.release()
         landmarker.close()
+        if face_landmarker is not None:
+            face_landmarker.close()
 
-    q = take_quality([len(h) for h in hands_per_frame], file_fps, sign, expected_frames, fps_actual)
+    q = take_quality([len(h) for h in hands_per_frame], file_fps, sign, expected_frames, fps_actual, clip_seconds,
+                     face_visible if face_landmarker is not None else None)
+    if face_landmarker is None:
+        q.warnings.append("Face check skipped: models\\face_landmarker.task not found (README Setup step 4).")
     return ClipReview(frames, hands_per_frame, n, q.hand_detect_rate, q.both_hands_rate,
-                      brightness_sum / max(n, 1), q.warnings, q.window_start, q.window_end, file_fps)
+                      brightness_sum / max(n, 1), q.warnings, q.window_start, q.window_end, file_fps,
+                      q.face_visible_rate)
 
 
 @dataclass
@@ -387,14 +412,18 @@ class TakeQuality:
     window_start: int            # sign window (hudyat_common.sign_window), end inclusive
     window_end: int
     warnings: list[str]
+    face_visible_rate: float | None = None   # over the hands-down frames; None = not checked
 
 
 def take_quality(hand_counts: list[int], fps: float, sign: hc.Sign, expected_frames: int,
-                 fps_actual: float) -> TakeQuality:
+                 fps_actual: float, clip_seconds: float = hc.CLIP_SECONDS,
+                 face_visible: list[bool | None] | None = None) -> TakeQuality:
     """Quality numbers + warnings for one take, from the number of hands per frame.
 
     The detection rates are measured inside the sign window, exactly as
     extract_landmarks.py does, because signers start and end with hands down.
+    face_visible: per frame, whether the whole face was in the picture (None =
+    not checked, e.g. a hand was in the picture); None for the whole take = no face check.
     """
     counts = np.asarray(hand_counts)
     n = len(counts)
@@ -418,8 +447,12 @@ def take_quality(hand_counts: list[int], fps: float, sign: hc.Sign, expected_fra
         where = "start and end" if at_start and at_end else "start" if at_start else "end"
         warnings.append(f"Hand visible at the {where}. Start and end with hands down.")
     if 0 < fps_actual < hc.MIN_ACCEPTABLE_FPS:
-        warnings.append(f"Low fps during take ({fps_actual:.1f}); still a full {hc.CLIP_SECONDS:.0f} s.")
-    return TakeQuality(hdr, bhr, start, end, warnings)
+        warnings.append(f"Low fps during take ({fps_actual:.1f}); still a full {clip_seconds:g} s.")
+    checked = [v for v in face_visible or [] if v is not None]
+    face_rate = sum(checked) / len(checked) if checked else None
+    if face_rate is not None and face_rate < hc.FACE_VISIBLE_WARN_RATE:
+        warnings.append(f"Face not fully visible ({face_rate:.0%}). Keep the forehead and chin in the picture.")
+    return TakeQuality(hdr, bhr, start, end, warnings, face_rate)
 
 
 # =============================================================================
@@ -471,10 +504,13 @@ class App:
         HOME (signer cards) -> CATEGORIES -> SIGNS -> RECORD
                                                    -> TAKES -> PLAYER
         HOME / CATEGORIES / SIGNS -> OVERVIEW (signers x categories)
+        HOME -> REF_LIST (reference-video categories) -> REF_SIGNS -> RECORD (reference mode)
 
     The camera thread runs the whole time, so moving between screens never
     reopens the camera. On the RECORD screen the recorder works exactly as
     before: LIVE -> COUNTDOWN -> RECORDING -> REVIEW -> LIVE ... -> FINISHED.
+    In reference mode (self.ref_mode) the same RECORD screen records one
+    take per sign into references/ instead of dataset/.
     """
 
     def __init__(self, all_signs: list[hc.Sign], cap: cv2.VideoCapture,
@@ -524,6 +560,16 @@ class App:
         self._detect_counter = 0
         self._t0 = time.perf_counter()
         self._last_ts_ms = -1
+
+        # --- reference mode (REF_LIST + REF_SIGNS + RECORD; files under references/) ---
+        self.ref_mode = False
+        self.ref_seconds = ref.REF_SECONDS
+        self.refs: list[ref.RefSign] = []
+        self.ref_done: set[str] = set()
+        self.ref_v2: set[str] = set()                    # signs that also have a version 2
+        self.ref_version = 1                             # version the take being recorded is for
+        self.ref_hand = ""
+        self.ref_folder = ""                             # category folder open in REF_SIGNS / RECORD
 
         # --- interface ---
         self.message = ""
@@ -581,8 +627,130 @@ class App:
         self.message_until = time.perf_counter() + TOAST_SECONDS
 
     def log_write(self, text: str) -> None:
-        if self.log is not None:
+        if self.ref_mode:                                # reference mode: references/reference_log.txt
+            ref.log(text)
+        elif self.log is not None:
             self.log.write(text)
+
+    @property
+    def clip_seconds(self) -> float:
+        return self.ref_seconds if self.ref_mode else hc.CLIP_SECONDS
+
+    @property
+    def current_ref(self) -> ref.RefSign | None:
+        return self.refs[self.sign_index] if self.ref_mode and self.sign_index < len(self.refs) else None
+
+    def is_complete(self, sign: hc.Sign) -> bool:
+        """Dataset: all takes kept. Reference mode: the reference video exists."""
+        if self.ref_mode:
+            return sign.sign_id in self.ref_done
+        return self.kept_for(sign) >= sign.reps
+
+    # ----- reference mode -----------------------------------------------------
+    def enter_reference(self) -> None:
+        """'Reference videos' button / --reference: ask which hand signs (anyone can sign)."""
+        if not self.leave_record_ok():
+            return
+        try:
+            self.refs = ref.reference_signs(self.all_signs)
+        except ValueError as exc:
+            self.set_message(str(exc), ui.DANGER)
+            return
+        state = ref.load_state()
+        self.ref_hand = state.get("hand", "") if state.get("hand") in store.HANDS else ""
+        self.modal = "ref_setup"
+
+    def start_reference(self, hand: str) -> None:
+        """Hand button clicked: switch to reference mode and show the sign list."""
+        self.modal = None
+        self.ref_mode = True
+        self.ref_hand = hand
+        state = ref.load_state()
+        state["hand"] = hand
+        ref.save_state(state)
+        self.signs = [r.sign for r in self.refs]
+        last = state.get("last_sign_id")
+        self.sign_index = next((r.index for r in self.refs if r.sign.sign_id == last), 0)
+        self.ref_done = ref.done_ids(self.refs)
+        self.ref_v2 = ref.version2_ids(self.refs)
+        ref.write_form_files(self.refs)                  # form material always matches the current list
+        ref.log(f"REFERENCE SESSION hand={self.ref_hand} seconds={self.ref_seconds:g} "
+                f"done={len(self.ref_done)}/{len(self.refs)}")
+        for line in self.camera_lines:
+            ref.log(line)
+        self.open_ref_list()
+
+    def open_ref_list(self) -> None:
+        """Category tiles; the category of the last sign used is outlined."""
+        self.ref_done = ref.done_ids(self.refs)
+        self.ref_v2 = ref.version2_ids(self.refs)
+        self.screen = "REF_LIST"
+        if self.sign_index < len(self.refs):
+            self.ref_folder = self.refs[self.sign_index].folder
+
+    def open_ref_signs(self, folder: str) -> None:
+        """The signs of one category, scrolled to the last sign used."""
+        self.ref_done = ref.done_ids(self.refs)
+        self.ref_v2 = ref.version2_ids(self.refs)
+        self.ref_folder = folder
+        self.screen = "REF_SIGNS"
+        items = self.ref_folder_indices(folder)
+        pos = items.index(self.sign_index) if self.sign_index in items else 0
+        self.scroll["ref_signs"] = max(0, pos // REF_SIGN_COLS - 1)
+
+    def ref_folder_indices(self, folder: str) -> list[int]:
+        """Indexes (into self.refs / self.signs) of the signs in one category folder."""
+        return [r.index for r in self.refs if r.folder == folder]
+
+    def exit_reference(self) -> None:
+        if not self.ref_mode:
+            return
+        ref.log(f"REFERENCE SESSION END done={len(self.ref_done)}/{len(self.refs)}")
+        self.ref_mode = False
+        self.signs = self.category_signs(self.category) if self.category else []
+        self.sign_index = 0
+
+    def ref_step(self, step: int) -> None:
+        """N / B: next or previous sign (discarding a take that is waiting for review)."""
+        if self.review is not None or self.job is not None:
+            self.discard_pending_take()
+            self.log_write(f"DISCARDED take of {self.sign.sign_id if self.sign else ''} ({'next' if step > 0 else 'previous'})")
+        new = self.sign_index + step
+        if new < 0:
+            self.set_message("This is the first sign.", ui.WARNING)
+            new = 0
+        if new >= len(self.signs):
+            self.sign_index = len(self.signs)
+            self.state = "FINISHED"
+            return
+        self.select_record_sign(new)
+
+    def keep_reference(self) -> None:
+        """K in reference mode: export .mp4 + .gif, update the manifest and the form files."""
+        job, review, r, version = self.job, self.review, self.current_ref, self.ref_version
+        assert job is not None and review is not None and r is not None
+        self.render_busy("Saving reference video (MP4 + GIF)...")
+        stem = ref.version_stem(r, version)
+        try:
+            result = ref.keep_take(job.path, r, self.refs, window_start=review.window_start,
+                                   window_end=review.window_end, fps=review.fps, n_frames=review.n_frames_read,
+                                   hand_detect_rate=review.hand_detect_rate,
+                                   hand=self.ref_hand, version=version)
+        except (RuntimeError, OSError) as exc:            # stays in review: K again, or R
+            self.set_message(f"Could not save: {exc}", ui.DANGER)
+            ref.log(f"SAVE FAILED {stem}: {exc}")
+            return
+        self.job, self.review = None, None
+        (self.ref_done if version == 1 else self.ref_v2).add(r.sign.sign_id)
+        self.session_kept += 1
+        self.totals["kept"] += 1
+        gif = f"GIF {result.gif_bytes / 1024:.0f} KB, {result.gif_settings}"
+        if not result.gif_under_limit:
+            self.set_message(f"Saved {stem}, but the GIF is still over 2 MB ({gif})", ui.WARNING)
+        else:
+            old = " · old version moved to references\\_old" if result.archived else ""
+            self.set_message(f"Saved {stem} ({result.seconds:.1f} s · {gif}){old}", ui.SUCCESS)
+        self.ref_step(1)
 
     # ----- navigation -------------------------------------------------------
     def select_signer(self, code: str) -> None:
@@ -643,9 +811,16 @@ class App:
         """Jump to a sign on the recording screen (chips / sign list)."""
         self.sign_index = max(0, min(index, len(self.signs) - 1))
         sign = self.signs[self.sign_index]
-        self.take = self.next_free_take(sign)
         self.state = "LIVE"
         self._chips_follow = True
+        if self.ref_mode:                                # remembered for the next session
+            self.ref_folder = self.refs[self.sign_index].folder
+            state = ref.load_state()
+            state["last_sign_id"] = sign.sign_id
+            ref.save_state(state)
+            self.log_write(f"SIGN {sign.sign_id} ({'done' if self.is_complete(sign) else 'pending'})")
+            return
+        self.take = self.next_free_take(sign)
         self.log_write(f"SIGN {sign.sign_id} ({self.kept_for(sign)}/{sign.reps} kept)")
 
     def open_takes(self, sign: hc.Sign) -> None:
@@ -689,6 +864,14 @@ class App:
             return
         if self.screen == "PLAYER" and screen != "PLAYER":
             self.close_player()
+        if screen == "REF_LIST":
+            self.open_ref_list()
+            return
+        if screen == "REF_SIGNS":
+            self.open_ref_signs(self.ref_folder)
+            return
+        if self.ref_mode:                                # any other screen ends reference mode
+            self.exit_reference()
         if screen == "OVERVIEW":
             self.open_overview()
             return
@@ -700,8 +883,9 @@ class App:
         self.screen = screen
 
     def go_back(self) -> None:
-        back = {"RECORD": "SIGNS", "PLAYER": "TAKES", "TAKES": "SIGNS", "SIGNS": "CATEGORIES",
-                "CATEGORIES": "HOME", "OVERVIEW": self.overview_return}
+        back = {"RECORD": "REF_SIGNS" if self.ref_mode else "SIGNS", "PLAYER": "TAKES", "TAKES": "SIGNS",
+                "SIGNS": "CATEGORIES", "CATEGORIES": "HOME", "OVERVIEW": self.overview_return,
+                "REF_SIGNS": "REF_LIST", "REF_LIST": "HOME"}
         if self.screen in back:
             self.navigate(back[self.screen])
 
@@ -744,17 +928,21 @@ class App:
 
     def start_recording(self) -> None:
         sign = self.sign
-        assert sign is not None and self.signer is not None
-        folder = clip_dir(sign, self.signer)
-        folder.mkdir(parents=True, exist_ok=True)
-        stem = folder / (clip_stem(sign, self.signer, self.take) + hc.TMP_TAG)
+        if self.ref_mode:                                # raw reference take: references/_tmp/
+            assert sign is not None
+            stem = ref.tmp_dir() / (sign.sign_id + hc.TMP_TAG)
+        else:
+            assert sign is not None and self.signer is not None
+            folder = clip_dir(sign, self.signer)
+            folder.mkdir(parents=True, exist_ok=True)
+            stem = folder / (clip_stem(sign, self.signer, self.take) + hc.TMP_TAG)
         try:
             writer, path, codec = hc.open_video_writer(stem, self.writer_fps, (self.width, self.height))
         except RuntimeError as exc:
             self.set_message(str(exc), ui.DANGER)
             self.state = "LIVE"
             return
-        self.job = RecordingJob(writer, path, codec, hc.CLIP_SECONDS)
+        self.job = RecordingJob(writer, path, codec, self.clip_seconds)
         self.worker.start_job(self.job)
         self.state = "RECORDING"
 
@@ -770,7 +958,7 @@ class App:
             self.state = "LIVE"
             return
         self.render_busy("Analyzing take...")
-        self.review = analyze_clip(job.path, self.sign, job.measured_fps(), job.frames_written)
+        self.review = analyze_clip(job.path, self.sign, job.measured_fps(), job.frames_written, self.clip_seconds)
         self.review_start = time.perf_counter()
         self.state = "REVIEW"
 
@@ -781,6 +969,9 @@ class App:
         self.review = None
 
     def keep_take(self) -> None:
+        if self.ref_mode:
+            self.keep_reference()
+            return
         job, review, sign, signer = self.job, self.review, self.sign, self.signer
         assert job is not None and review is not None and sign is not None and signer is not None
         # Never overwrite: if the final name is taken somehow, use the next free take.
@@ -835,7 +1026,7 @@ class App:
     def retake(self) -> None:
         self.discard_pending_take()
         self.totals["retaken"] += 1
-        if self.log is not None:
+        if self.log is not None and not self.ref_mode:
             self.log.counts["retaken"] += 1
         self.log_write(f"RETAKE {self.sign.sign_id if self.sign else ''} take {self.take:02d} discarded")
         self.set_message("Take discarded. Press SPACE to record again.", ui.WARNING)
@@ -938,6 +1129,9 @@ class App:
                 self.modal = None
                 self.pending_category = None
             return False
+        if self.modal == "ref_setup":
+            self.ref_setup_action(action)
+            return False
 
         kind, _, arg = action.partition(":")
         if action == "back":
@@ -946,6 +1140,16 @@ class App:
             self.navigate("HOME")
         elif action == "overview":
             self.navigate("OVERVIEW")
+        elif action == "reference":
+            self.enter_reference()
+        elif action == "ref_list":
+            self.navigate("REF_LIST")
+        elif action == "ref_signs":
+            self.navigate("REF_SIGNS")
+        elif kind == "refcat":                            # REF_LIST: open a category
+            self.open_ref_signs(ref.CATEGORY_FOLDERS[int(arg)][0])
+        elif kind == "ref":                               # REF_SIGNS: open a sign
+            self.open_record(int(arg))
         elif action == "crumb:signer" and self.signer:
             self.navigate("CATEGORIES")
         elif action == "crumb:category" and self.category:
@@ -992,10 +1196,55 @@ class App:
             self.show_guides = not self.show_guides
         return False
 
+    def ref_setup_action(self, action: str) -> None:
+        """Setup dialog of reference mode: a hand button (or L / R) starts at once."""
+        hand = {"refhand:left": "left", "refhand:right": "right", "key:l": "left", "key:r": "right"}.get(action)
+        if hand:
+            self.start_reference(hand)
+        elif action in ("refcancel", "back"):
+            self.modal = None
+
+    def handle_ref_key(self, key: str) -> None:
+        """Reference mode keys: SPACE record, V record version 2; review K keep, R redo;
+        N next, B previous; P pause."""
+        if self.state == "REVIEW":
+            if key == "k":
+                self.keep_take()
+            elif key == "r":
+                self.retake()
+            elif key in ("n", "b"):
+                self.ref_step(1 if key == "n" else -1)
+            return
+        if key in ("n", "b") and self.state in ("LIVE", "FINISHED"):
+            self.ref_step(1 if key == "n" else -1)
+        elif key == "p" and self.state in ("LIVE", "COUNTDOWN"):
+            self.paused = not self.paused
+            self.state = "LIVE"
+            self.set_message("PAUSED - press P to resume" if self.paused else "Resumed", ui.WARNING)
+        elif key in (" ", "v") and self.state == "LIVE" and not self.paused and self.sign is not None:
+            version = 2 if key == "v" else 1
+            if version == 2 and not self.is_complete(self.sign):
+                self.set_message("Record the first version with SPACE before adding a second one.", ui.WARNING)
+                return
+            if version == 2 and self.sign.sign_id in self.ref_v2:
+                self.set_message("Recording version 2 again: the current version 2 will be moved to "
+                                 "references\\_old when you keep the new one.", ui.WARNING)
+            elif version == 2:
+                self.set_message("Recording version 2: another way of signing it. Version 1 stays.", ui.PRIMARY)
+            elif self.is_complete(self.sign):
+                self.set_message("Recording again: the current version will be moved to references\\_old "
+                                 "when you keep the new one.", ui.WARNING)
+            self.ref_version = version
+            self.countdown_start = time.perf_counter()
+            self.state = "COUNTDOWN"
+
     def handle_record_key(self, key: str) -> None:
         """The recorder's keys (unchanged): SPACE K R S P G."""
         if key == "g":
             self.show_guides = not self.show_guides
+            return
+        if self.ref_mode:
+            self.handle_ref_key(key)
             return
         if self.state == "FINISHED":
             return
@@ -1066,12 +1315,17 @@ class App:
         else:
             canvas = ui.backdrop(frame)
             {"HOME": self.draw_home, "CATEGORIES": self.draw_categories, "SIGNS": self.draw_signs,
-             "TAKES": self.draw_takes, "OVERVIEW": self.draw_overview}[self.screen](canvas)
+             "TAKES": self.draw_takes, "OVERVIEW": self.draw_overview,
+             "REF_LIST": self.draw_ref_list, "REF_SIGNS": self.draw_ref_signs}[self.screen](canvas)
             self.draw_notices(canvas, ui.UI_H - ui.MARGIN - 46)
-        if self.modal == "hand":
+        if self.modal in ("hand", "ref_setup"):
             self.hits.clear()                            # only the dialog is clickable
             self.scroll_regions.clear()
-            self.draw_hand_modal(canvas)
+            if self.modal == "hand":
+                self.draw_hand_modal(canvas)
+            else:
+                self.draw_ref_setup(canvas)
+                self.draw_notices(canvas, ui.UI_H - ui.MARGIN - 46)
         self.draw_hover(canvas)
         self._last_canvas = canvas
         return canvas
@@ -1087,6 +1341,13 @@ class App:
     def crumbs(self) -> list[tuple[str, str | None]]:
         """Breadcrumb (label, action) list for the current screen."""
         out: list[tuple[str, str | None]] = [("Signers", "home")]
+        if self.ref_mode:
+            out.append(("Reference videos", "ref_list"))
+            if self.screen in ("REF_SIGNS", "RECORD") and self.ref_folder:
+                out.append((ref.folder_title(self.ref_folder), "ref_signs"))
+            if self.screen == "RECORD" and self.sign is not None:
+                out.append((self.sign.sign_label, None))
+            return out
         if self.screen == "OVERVIEW":
             return out + [("Progress overview", None)]
         if self.screen == "HOME" or not self.signer:
@@ -1135,12 +1396,17 @@ class App:
         q.draw(canvas, qx, m + 2)
         ui.key_badge("Q").draw(canvas, qx + q.width - 14, m + 28)
         self.hits.add(qx, m + 2, q.width, q.height, "quit")
-        if self.screen != "OVERVIEW":
+        if self.screen not in ("OVERVIEW", "REF_LIST", "REF_SIGNS"):
             o = ui.pill("Progress overview", 15, "semibold", ui.WHITE, ui.PRIMARY, 0.92, height=40, pad=18,
                         icon="chart")
             ox = qx - 12 - o.width
             o.draw(canvas, ox, m + 2)
             self.hits.add(ox, m + 2, o.width, o.height, "overview")
+            if self.screen == "HOME":                    # reference videos for the expert validation
+                rv = ui.pill("Reference videos", 15, "semibold", height=40, pad=18, bg_alpha=0.6, icon="play")
+                rx = ox - 12 - rv.width
+                rv.draw(canvas, rx, m + 2)
+                self.hits.add(rx, m + 2, rv.width, rv.height, "reference")
         t = ui.title(title, ui.fit_title_size(title, 900, 46))
         ty = m + 58
         t.draw(canvas, m, ty)
@@ -1444,6 +1710,99 @@ class App:
                     self.hits.add(x, y, cw - 6, rh, f"open:{code}:{cat}")
         self.draw_caption(canvas, "Green = complete  ·  blue = in progress  ·  Esc back")
 
+    # ----- drawing: REF_LIST (reference videos: category tiles) ---------------------
+    def draw_ref_list(self, canvas: np.ndarray) -> None:
+        """Same layout as the CATEGORIES screen: one tile per category folder."""
+        done_all, total_all = len(self.ref_done), len(self.refs)
+        top = self.draw_header(canvas, "Reference videos",
+                               f"{done_all} / {total_all} recorded  ·  {self.ref_hand.title()} hand  ·  "
+                               f"one {self.ref_seconds:g}-second take per sign")
+        w, h, gap = 284, 132, 18
+        x0 = (ui.UI_W - (4 * w + 3 * gap)) // 2
+        for i, (folder, _) in enumerate(ref.CATEGORY_FOLDERS):
+            items = self.ref_folder_indices(folder)
+            done = sum(1 for k in items if self.refs[k].sign.sign_id in self.ref_done)
+            complete = done == len(items)
+            last = folder == self.ref_folder                     # category of the last sign used
+            x, y = x0 + (i % 4) * (w + gap), top + (i // 4) * (h + gap)
+            icons = (("check", w - 52, 14, 30, ui.SUCCESS, 1.0),) if complete else ()
+            ui.box(w, h, 22, ui.SUCCESS if complete else ui.DARK, 0.30 if complete else 0.62,
+                   outline=ui.SUCCESS if complete else (ui.PRIMARY if last else None), icons=icons, texts=(
+                       (22, 32, folder, 19, "semibold", ui.WHITE, 1.0, "lm"),
+                       (22, 76, f"{done} / {len(items)}", 28, "bold", ui.SUCCESS if complete else ui.WHITE, 1.0, "lm"),
+                       (w - 22, 78, f"{len(items)} sign{'s' if len(items) != 1 else ''}", 13, "regular",
+                        ui.MUTED, 1.0, "rm"),
+                   )).draw(canvas, x, y)
+            ui.progress_bar(w - 44, 6, done / len(items) if items else 0).draw(canvas, x + 22, y + h - 24)
+            self.hits.add(x, y, w, h, f"refcat:{i}")
+        self.draw_caption(canvas, "Click a category   ·   blue outline = last used   ·   Esc back")
+
+    # ----- drawing: REF_SIGNS (reference videos: signs of one category) ---------------
+    def draw_ref_signs(self, canvas: np.ndarray) -> None:
+        """Same layout as the SIGNS screen: each sign marked done or pending."""
+        items = self.ref_folder_indices(self.ref_folder)
+        done = sum(1 for k in items if self.refs[k].sign.sign_id in self.ref_done)
+        top = self.draw_header(canvas, ref.folder_title(self.ref_folder),
+                               f"{done} / {len(items)} recorded  ·  click a sign to record it")
+        cols, gap, rh, step = REF_SIGN_COLS, 16, 52, 62
+        right_pad = 50                                   # room for the scroll buttons
+        cw = (ui.UI_W - 2 * ui.MARGIN - right_pad - (cols - 1) * gap) // cols
+        bottom = ui.UI_H - ui.MARGIN - 46 - 14
+        visible_rows = max(1, (bottom - top) // step)
+        total_rows = (len(items) + cols - 1) // cols
+        first = self._scroll_window("ref_signs", total_rows, visible_rows)
+        self.scroll_regions.append((ui.MARGIN, top, ui.UI_W - ui.MARGIN, bottom, "ref_signs"))
+        for row in range(first, min(total_rows, first + visible_rows)):
+            for c in range(cols):
+                p = row * cols + c
+                if p >= len(items):
+                    break
+                i = items[p]
+                r = self.refs[i]
+                x, y = ui.MARGIN + c * (cw + gap), top + (row - first) * step
+                is_done = r.sign.sign_id in self.ref_done
+                last = i == self.sign_index
+                label = r.title if len(r.title) <= 24 else r.title[:23] + "…"
+                icons = (("check", cw - 18 - ui.text_width("done", 14, "semibold") - 26, rh / 2 - 10, 20,
+                          ui.SUCCESS, 1.0),) if is_done else ()
+                ui.box(cw, rh, 16, ui.SUCCESS if is_done else ui.DARK, 0.28 if is_done else 0.62,
+                       outline=ui.PRIMARY if last else (ui.SUCCESS if is_done else None),
+                       outline_alpha=0.9 if last else 0.7, icons=icons, texts=(
+                           (18, rh / 2, label, 16, "medium", ui.WHITE, 1.0, "lm"),
+                           (cw - 18, rh / 2, "done" if is_done else "pending", 14, "semibold",
+                            ui.SUCCESS if is_done else ui.MUTED, 1.0, "rm"))).draw(canvas, x, y)
+                self.hits.add(x, y, cw, rh, f"ref:{i}")
+        if total_rows > visible_rows:
+            self.draw_scroll_buttons(canvas, "ref_signs", ui.UI_W - ui.MARGIN - 34, top, bottom,
+                                     first > 0, first + visible_rows < total_rows)
+        self.draw_caption(canvas, "Click a sign to record it   ·   blue outline = last sign   ·   Esc back")
+
+    def draw_ref_setup(self, canvas: np.ndarray) -> None:
+        """Asked when reference mode starts: anyone can sign; click the hand to start."""
+        ui.dim(canvas, 0.55)
+        w, h = 620, 300
+        x, y = (ui.UI_W - w) // 2, (ui.UI_H - h) // 2
+        ui.box(w, h, 24, ui.DARK, 0.92, outline=ui.WHITE, outline_alpha=0.25, texts=(
+            (w / 2, 48, "Reference videos", 24, "semibold", ui.WHITE, 1.0, "mm"),
+            (w / 2, 84, "Anyone who knows the signs can record. Which hand will sign?", 14, "regular",
+             ui.MUTED, 1.0, "mm"))).draw(canvas, x, y)
+        bw, bh, gap = 250, 64, 40
+        for i, hand in enumerate(store.HANDS):
+            bx = x + (w - 2 * bw - gap) // 2 + i * (bw + gap)
+            last = self.ref_hand == hand                 # the hand used last time
+            ui.box(bw, bh, bh // 2, ui.PRIMARY, 0.95 if last else 0.7,
+                   outline=ui.WHITE if last else None, outline_alpha=0.6, texts=(
+                       (bw / 2, bh / 2, f"{hand.title()} hand · start", 18, "semibold", ui.WHITE, 1.0, "mm"),)
+                   ).draw(canvas, bx, y + 120)
+            self.hits.add(bx, y + 120, bw, bh, f"refhand:{hand}")
+        c = ui.pill("Cancel", 15, height=40, pad=18, bg_alpha=0.6)
+        cx = x + (w - c.width) // 2
+        c.draw(canvas, cx, y + h - 76)
+        self.hits.add(cx, y + h - 76, c.width, c.height, "refcancel")
+        hint = ui.pill("L left hand  ·  R right hand  ·  Esc cancel", 13, height=28, pad=12,
+                       fg=ui.MUTED, bg_alpha=0.0)
+        hint.draw(canvas, x + (w - hint.width) // 2, y + h - 32)
+
     # ----- drawing: RECORD screen ---------------------------------------------------
     def render_record(self, frame: np.ndarray | None) -> np.ndarray:
         sign = self.sign
@@ -1488,6 +1847,9 @@ class App:
         name = ui.title(label, ui.fit_title_size(label, TITLE_MAX_WIDTH))
         name_y = m + 62
         name.draw(canvas, m, name_y)
+        if self.ref_mode:
+            self.draw_ref_pills(canvas, sign, hands, name_y + name.height + 4)
+            return
         kept = self.kept_for(sign)
         bar_y = name_y + name.height + 4
         ui.progress_bar(PROGRESS_W, 8, kept / sign.reps).draw(canvas, m + 2, bar_y)
@@ -1514,6 +1876,35 @@ class App:
         if self.state == "REVIEW" and self.review is not None:
             self.draw_quality_card(canvas, sign, m, y + 8)
 
+    def draw_ref_pills(self, canvas: np.ndarray, sign: hc.Sign, hands: list[hc.DetectedHand], bar_y: int) -> None:
+        """Reference mode, under the sign name: overall progress, file name, done/pending, hands."""
+        m, r = ui.MARGIN, self.current_ref
+        assert r is not None
+        done, total = len(self.ref_done), len(self.refs)
+        ui.progress_bar(PROGRESS_W, 8, done / total if total else 0).draw(canvas, m + 2, bar_y)
+        y = bar_y + 24
+        is_done = self.is_complete(sign)
+        status = "pending"
+        if is_done:
+            status = "done + version 2" if sign.sign_id in self.ref_v2 else "done"
+        if self.state in ("COUNTDOWN", "RECORDING", "REVIEW") and self.ref_version == 2:
+            status += "  ·  now recording version 2"
+        pills = [
+            ui.pill(f"Reference · {self.ref_hand} hand · {done} / {total}"),
+            ui.pill(f"{r.folder}  ›  {r.file_stem}  ·  {status}",
+                    dot=ui.SUCCESS if is_done else ui.MUTED),
+            ui.pill(f"Hands: {sign.hands}", dot=ui.SUCCESS if len(hands) >= sign.hands else ui.MUTED),
+        ]
+        if self.state in ("LIVE", "COUNTDOWN"):
+            text, dot, warn = ui.brightness_info(self.brightness)
+            if warn:
+                pills.append(ui.pill(text, dot=dot))
+        for p in pills:
+            p.draw(canvas, m, y)
+            y += p.height + 8
+        if self.state == "REVIEW" and self.review is not None:
+            self.draw_quality_card(canvas, sign, m, y + 8)
+
     def draw_quality_card(self, canvas: np.ndarray, sign: hc.Sign, x: int, y: int) -> None:
         r = self.review
         assert r is not None
@@ -1529,6 +1920,9 @@ class App:
              color(r.hand_detect_rate, hc.HAND_DETECT_WARN_RATE), False),
             ("Both hands", f"{r.both_hands_rate:.0%}",
              color(r.both_hands_rate, hc.BOTH_HANDS_WARN_RATE) if two else ui.MUTED, two),
+            ("Face visible", "not checked" if r.face_visible_rate is None else f"{r.face_visible_rate:.0%}",
+             ui.MUTED if r.face_visible_rate is None else color(r.face_visible_rate, hc.FACE_VISIBLE_WARN_RATE),
+             False),
             ("Sign window", f"{win:.2f} s", ui.WHITE, False),       # the part kept after trimming
             ("Duration", f"{dur:.2f} s", ui.WHITE, False),
         ]
@@ -1550,20 +1944,26 @@ class App:
         ui.round_button("settings", gd, bg=ui.PRIMARY if on else ui.DARK,
                         bg_alpha=0.9 if on else ui.PANEL_ALPHA).draw(canvas, gx, m)
         self.hits.add(gx, m, gd, gd, "key:g")
-        cat = ui.pill(store.category_title(self.category or ""), 16, "semibold", height=gd, pad=20)
+        r = self.current_ref
+        text = (r.category_title if r else "Reference videos") if self.ref_mode \
+            else store.category_title(self.category or "")
+        cat = ui.pill(text, 16, "semibold", height=gd, pad=20)
         cx = gx - 10 - cat.width
         cat.draw(canvas, cx, m)
-        self.hits.add(cx, m, cat.width, cat.height, "crumb:signer")
+        self.hits.add(cx, m, cat.width, cat.height, "ref_signs" if self.ref_mode else "crumb:signer")
         self.draw_chips(canvas, m + gd + 14, ui.UI_H - 160)
 
     def draw_chips(self, canvas: np.ndarray, top: int, bottom: int) -> None:
         """Clickable, scrollable list of the signs: done (tick), current (blue), upcoming (dim)."""
         right, step, d = ui.UI_W - ui.MARGIN, 36, 30
-        total, cur = len(self.signs), self.sign_index
+        # Reference mode lists only the current category; otherwise every sign of the open category.
+        items = self.ref_folder_indices(self.ref_folder) if self.ref_mode else list(range(len(self.signs)))
+        total = len(items)
+        cur = items.index(self.sign_index) if self.sign_index in items else -1
         fit = max(3, (bottom - top) // step)
         scrollable = total > fit
         visible = fit - 2 if scrollable else total       # room for the up/down buttons
-        if scrollable and getattr(self, "_chips_follow", False):
+        if scrollable and getattr(self, "_chips_follow", False) and cur >= 0:
             first = self.scroll.get("chips", 0)          # keep the current sign in view
             if cur < first:
                 self.scroll["chips"] = cur
@@ -1578,10 +1978,12 @@ class App:
             if first > 0:
                 self.hits.add(right - d, y, d, d, "scroll:chips:-1")
             y += step
-        for i in range(first, min(total, first + visible)):
+        for p in range(first, min(total, first + visible)):
+            i = items[p]
             s = self.signs[i]
-            state = "done" if self.kept_for(s) >= s.reps else "current" if i == cur else "next"
-            c = ui.chip(s.sign_label, state)
+            state = "current" if self.ref_mode and p == cur else \
+                "done" if self.is_complete(s) else "current" if p == cur else "next"
+            c = ui.chip(self.refs[i].title if self.ref_mode else s.sign_label, state)
             c.draw(canvas, right - c.width, y)
             self.hits.add(right - c.width, y, c.width, c.height, f"chip:{i}")
             y += step
@@ -1610,8 +2012,11 @@ class App:
             p = ui.pill("Paused", 30, "semibold", height=72, pad=40, bg_alpha=0.65)
             p.draw(canvas, cx - p.width // 2, cy - p.height // 2)
         if self.state == "FINISHED":
-            left = sum(1 for s in self.signs if self.kept_for(s) < s.reps)
-            text = "Category complete" if left == 0 else f"End of list · {left} sign(s) still need takes"
+            left = sum(1 for s in self.signs if not self.is_complete(s))
+            if self.ref_mode:
+                text = "All reference videos recorded" if left == 0 else f"End of list · {left} sign(s) pending"
+            else:
+                text = "Category complete" if left == 0 else f"End of list · {left} sign(s) still need takes"
             p = ui.pill(text, 26, "semibold", dot=ui.SUCCESS if left == 0 else ui.WARNING, height=68, pad=34,
                         bg_alpha=0.7)
             p.draw(canvas, cx - p.width // 2, cy - p.height // 2)
@@ -1626,10 +2031,22 @@ class App:
         rec.draw(canvas, (ui.UI_W - rec.width) // 2, ui.MARGIN)
         bar = ui.progress_bar(REC_BAR_W, 8, round(frac, 2), colors=(ui.DANGER, (255, 150, 90)))
         bar.draw(canvas, (ui.UI_W - REC_BAR_W) // 2, ui.MARGIN + rec.height + 12)
-        self.draw_caption(canvas, f"Recording…  {frac * hc.CLIP_SECONDS:.1f} / {hc.CLIP_SECONDS:.0f} s  ·  {done} frames")
+        self.draw_caption(canvas, f"Recording…  {frac * self.clip_seconds:.1f} / {self.clip_seconds:g} s  ·  {done} frames")
 
     def caption_text(self) -> str:
         sign = self.sign
+        if self.ref_mode:
+            if self.state == "FINISHED":
+                return "B previous sign  ·  click a sign on the right  ·  Esc sign list"
+            if self.state == "REVIEW":
+                return "K keep  ·  R redo  ·  N next sign  ·  B previous sign"
+            if self.state == "COUNTDOWN":
+                return "Hands down — start from rest, end at rest"
+            if self.paused:
+                return "Paused — press P to resume"
+            if sign is not None and self.is_complete(sign):
+                return "SPACE record again  ·  V record version 2  ·  N next sign  ·  B previous sign"
+            return "SPACE record  ·  N next sign  ·  B previous sign"
         if self.state == "FINISHED":
             return "Click a sign on the right  ·  Esc back"
         if self.state == "REVIEW":
@@ -1664,16 +2081,28 @@ class App:
         # Record / Skip / Pause buttons (same as SPACE / S / P), bottom-left.
         sign = self.sign
         can_record = (self.state == "LIVE" and not self.paused and sign is not None
-                      and self.kept_for(sign) < sign.reps)
-        buttons = [
-            (ui.pill("Record", 16, "semibold", ui.WHITE, ui.DANGER, 0.92, height=44, pad=18, icon="record"),
-             "Space", "key: ", can_record),
-            (ui.pill("Skip", 16, "medium", height=44, pad=18, bg_alpha=0.65, icon="skip"),
-             "S", "key:s", self.state in ("LIVE", "REVIEW") and sign is not None),
-            (ui.pill("Resume" if self.paused else "Pause", 16, "medium", height=44, pad=18, bg_alpha=0.65,
-                     icon="play" if self.paused else "pause"),
-             "P", "key:p", self.state in ("LIVE", "COUNTDOWN")),
-        ]
+                      and (self.ref_mode or self.kept_for(sign) < sign.reps))
+        record = (ui.pill("Record", 16, "semibold", ui.WHITE, ui.DANGER, 0.92, height=44, pad=18, icon="record"),
+                  "Space", "key: ", can_record)
+        pause = (ui.pill("Resume" if self.paused else "Pause", 16, "medium", height=44, pad=18, bg_alpha=0.65,
+                         icon="play" if self.paused else "pause"),
+                 "P", "key:p", self.state in ("LIVE", "COUNTDOWN"))
+        if self.ref_mode:                                 # N / B instead of Skip
+            step_ok = self.state in ("LIVE", "REVIEW", "FINISHED")
+            buttons = [
+                record,
+                (ui.pill("Previous", 16, "medium", height=44, pad=18, bg_alpha=0.65), "B", "key:b", step_ok),
+                (ui.pill("Next", 16, "medium", height=44, pad=18, bg_alpha=0.65, icon="skip"), "N", "key:n",
+                 step_ok and sign is not None),
+                pause,
+            ]
+        else:
+            buttons = [
+                record,
+                (ui.pill("Skip", 16, "medium", height=44, pad=18, bg_alpha=0.65, icon="skip"),
+                 "S", "key:s", self.state in ("LIVE", "REVIEW") and sign is not None),
+                pause,
+            ]
         x, y = m, ui.UI_H - m - 28 - 12 - 44
         for sprite, badge, action, ok in buttons:
             op = 1.0 if ok else 0.3
@@ -1706,6 +2135,7 @@ class App:
         self.cap.release()
         self.landmarker.close()
         cv2.destroyAllWindows()
+        self.exit_reference()
         if self.log is not None:
             self.log.close(reason)
 
@@ -1728,7 +2158,14 @@ def parse_args(categories: list[str]) -> argparse.Namespace:
                         help="camera backend (remembered); compare them with --list-cameras")
     parser.add_argument("--list-cameras", action="store_true",
                         help="list cameras (index, name, resolution, measured fps) and exit")
-    return parser.parse_args()
+    parser.add_argument("--reference", action="store_true",
+                        help="Reference mode: one reference video per sign for the expert validation form")
+    parser.add_argument("--ref-seconds", type=float, default=ref.REF_SECONDS,
+                        help=f"length of a reference take in seconds (default {ref.REF_SECONDS:g})")
+    args = parser.parse_args()
+    if not 1.0 <= args.ref_seconds <= 10.0:
+        parser.error("--ref-seconds must be between 1 and 10")
+    return args
 
 
 def windows_camera_names() -> list[str]:
@@ -1806,6 +2243,12 @@ def main() -> int:
     if args.category and not args.signer:
         print("NOTE: --category only works together with --signer; opening the dashboard.")
         args.category = None
+    if args.reference:                                   # check the sign list before opening the camera
+        try:
+            ref.reference_signs(all_signs)
+        except ValueError as exc:
+            print(f"Reference mode stopped: {exc}")
+            return 1
 
     # Camera settings: command line > settings.json > defaults. Remember what was used.
     settings = store.load_settings()
@@ -1814,7 +2257,8 @@ def main() -> int:
             settings[key] = value
     store.save_settings(settings)
 
-    hc.RAW_DIR.mkdir(parents=True, exist_ok=True)
+    if not args.reference:                               # reference mode never touches dataset/
+        hc.RAW_DIR.mkdir(parents=True, exist_ok=True)
     print(f"Opening camera {settings['camera']} ({settings['backend']}) at "
           f"{hc.TARGET_WIDTH}x{hc.TARGET_HEIGHT} @ {hc.TARGET_FPS} fps...")
     cap = hc.open_camera(settings["camera"], backend=settings["backend"])
@@ -1828,13 +2272,16 @@ def main() -> int:
         return 1
 
     app = App(all_signs, cap, size, settings)
+    app.ref_seconds = args.ref_seconds
     if args.signer and args.hand:                        # --hand updates signers.csv
         app.signers[args.signer].hand = args.hand
         store.save_signers(app.signers)
     reason = "error"
     try:
         app.start_camera()
-        if args.signer:                                  # command-line shortcuts
+        if args.reference:
+            app.enter_reference()
+        elif args.signer:                                # command-line shortcuts
             app.select_signer(args.signer)
             if args.category:
                 if app.modal:                            # hand unknown: continue after the answer
@@ -1850,7 +2297,11 @@ def main() -> int:
         app.shutdown(reason)
     t = app.totals
     print(f"\nSession ended ({reason}). Kept {t['kept']}, retaken {t['retaken']}, skipped {t['skipped']}.")
-    print(f"Session logs: {hc.SESSION_LOG_DIR.relative_to(hc.PROJECT_DIR)}")
+    if args.reference or app.refs:
+        print(f"Reference videos: {ref.validation_dir().relative_to(hc.PROJECT_DIR)}  "
+              f"(log: {(ref.REF_DIR / 'reference_log.txt').relative_to(hc.PROJECT_DIR)})")
+    if not args.reference:
+        print(f"Session logs: {hc.SESSION_LOG_DIR.relative_to(hc.PROJECT_DIR)}")
     return 0
 
 
