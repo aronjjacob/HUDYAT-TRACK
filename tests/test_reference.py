@@ -17,7 +17,8 @@ import record_tool as rt
 
 FOLDERS = ["01 Alphabet", "02 Numbers", "03 Greetings", "04 Colors", "05 Shapes", "06 Family",
            "07 Calendar", "08 WH-Questions", "09 Word Concepts"]
-COUNTS = [26, 10, 10, 6, 8, 10, 22, 6, 10]
+COUNTS = [28, 10, 10, 6, 8, 10, 22, 6, 10]
+ALPHABET = [chr(c) for c in range(65, 91)] + ["Ñ", "NG"]   # A-Z keep 01-26; Ñ, NG are 27, 28
 
 
 @pytest.fixture(scope="module")
@@ -30,9 +31,9 @@ def sign(category, sign_id, label):
 
 
 # --- sign order and numbering ---------------------------------------------------
-def test_108_signs_in_table_order_numbered_per_folder(refs):
-    assert len(refs) == 108
-    assert [r.index for r in refs] == list(range(108))
+def test_110_signs_in_table_order_numbered_per_folder(refs):
+    assert len(refs) == 110
+    assert [r.index for r in refs] == list(range(110))
     folders = list(dict.fromkeys(r.folder for r in refs))
     assert folders == FOLDERS
     assert [sum(r.folder == f for r in refs) for f in FOLDERS] == COUNTS
@@ -42,24 +43,29 @@ def test_108_signs_in_table_order_numbered_per_folder(refs):
     assert greetings[0] == "01 Good Morning" and greetings[5] == "06 I'm Fine"
 
 
-def test_alphabet_is_a_to_z(refs):
-    assert [r.sign.sign_label for r in refs if r.folder == "01 Alphabet"] == [chr(c) for c in range(65, 91)]
+def test_alphabet_is_a_to_z_then_enye_and_ng(refs):
+    alphabet = [r for r in refs if r.folder == "01 Alphabet"]
+    assert [r.sign.sign_label for r in alphabet] == ALPHABET
+    assert alphabet[25].file_stem == "26 Z"
+    assert alphabet[26].file_stem == "27 Ñ" and alphabet[27].file_stem == "28 NG"
 
 
 @pytest.mark.parametrize("static", ["alphabet_static", "alphabet_static_test"])
 def test_static_and_dynamic_letters_merge_and_none_is_skipped(static):
     others = [s for s in hc.load_signs() if s.category != "alphabet"]
-    letters = [sign(static, f"letter_{c.lower()}", c) for c in "ABCDEFGHIKLMNOPQRSTUVWXY"]
+    letters = [sign(static, f"letter_{c.lower()}", c) for c in "ABCDEFGHIKLMN"]
+    letters += [sign(static, "letter_enye", "Ñ"), sign(static, "letter_ng", "NG")]
+    letters += [sign(static, f"letter_{c.lower()}", c) for c in "OPQRSTUVWXY"]
     dynamic = [sign("alphabet_dynamic", "letter_j", "J"), sign("alphabet_dynamic", "letter_z", "Z")]
     out = ref.reference_signs(dynamic + others + letters + [sign("none", "none", "None")])
     alphabet = [r for r in out if r.folder == "01 Alphabet"]
-    assert [r.sign.sign_label for r in alphabet] == [chr(c) for c in range(65, 91)]
+    assert [r.sign.sign_label for r in alphabet] == ALPHABET
     assert alphabet[9].file_stem == "10 J" and alphabet[25].file_stem == "26 Z"
-    assert len(out) == 108
+    assert len(out) == 110
 
 
 def test_wrong_total_stops():
-    with pytest.raises(ValueError, match="expected 108"):
+    with pytest.raises(ValueError, match="expected 110"):
         ref.reference_signs(hc.load_signs()[:-1])
 
 
@@ -224,7 +230,7 @@ def test_record_keep_files_manifest_and_form_files_without_webcam(refs, tmp_path
     folder = tmp_path / "validation"
     assert {"manifest.csv", "form_list.md", "build_validation_form.gs", "FORM_SETUP.md"} <= \
         {p.name for p in folder.iterdir()}
-    assert "Reference videos recorded: 1 / 108" in (folder / "form_list.md").read_text(encoding="utf-8")
+    assert "Reference videos recorded: 1 / 110" in (folder / "form_list.md").read_text(encoding="utf-8")
     gs = gs_sections(folder / "build_validation_form.gs")
     assert [s["folder"] for s in gs] == ["03 Greetings"]              # only signs with a video
     assert gs[0]["signs"] == [{"no": "06", "label": "I'm Fine", "sign_id": "im_fine", "mp4": "06 I'm Fine.mp4",
@@ -307,7 +313,7 @@ def test_generated_gs_has_recorded_signs_and_asks_for_help_with_the_rest(refs, t
     assert "getEditUrl()" in text and "getPublishedUrl()" in text
     assert "Which version is correct?" in text and "['Version 1', 'Version 2', 'Neither is correct']" in text
     assert "addCheckboxItem()" in text
-    assert "There are 98 signs in 8 groups" in text
+    assert "There are 100 signs in 8 groups" in text
     # Signs with a video are validated, in form order.
     sections = gs_sections(path)
     assert [s["folder"] for s in sections] == FOLDERS[:-1]
@@ -337,3 +343,60 @@ def test_no_help_section_when_every_sign_has_a_video(refs, tmp_path):
     path = tmp_path / "validation" / "build_validation_form.gs"
     assert gs_request_signs(path) == [] and len(gs_sections(path)) == 9
     assert "Not in the form yet" not in (tmp_path / "validation" / "form_list.md").read_text(encoding="utf-8")
+
+
+# --- deleting a saved video --------------------------------------------------------
+def saved_video(r, refs, base, version=1):
+    """A saved video on disk (.mp4 + .gif) with its manifest row."""
+    mp4, gif = ref.mp4_path(r, base, version), ref.gif_path(r, base, version)
+    mp4.parent.mkdir(parents=True, exist_ok=True)
+    mp4.write_bytes(b"mp4")
+    gif.write_bytes(b"gif")
+    rows = ref.read_manifest(base)
+    res = ref.ExportResult(mp4, gif, 2.0, 1024, 480, 12, True, [])
+    rows[(r.sign.sign_id, version)] = ref.manifest_row(r, res, 0.9, "right", version=version)
+    ref.write_manifest(rows, refs, base)
+
+
+def test_delete_video_erases_it_and_sends_the_sign_back_to_pending(refs, tmp_path):
+    r = next(x for x in refs if x.file_stem == "06 I'm Fine")
+    saved_video(r, refs, tmp_path)
+    ref.write_form_files(refs, tmp_path)
+    assert "I'm Fine" not in gs_request_signs(tmp_path / "validation" / "build_validation_form.gs")
+
+    ref.delete_video(r, refs, tmp_path)
+
+    folder = tmp_path / "validation" / "03 Greetings"
+    assert not (folder / "06 I'm Fine.mp4").exists() and not (folder / "06 I'm Fine.gif").exists()
+    assert ("im_fine", 1) not in ref.read_manifest(tmp_path)
+    assert "im_fine" not in ref.done_ids(refs, tmp_path)
+    assert not (tmp_path / "_old").exists()                        # permanent: nothing is archived
+    assert "I'm Fine" in gs_request_signs(tmp_path / "validation" / "build_validation_form.gs")
+    assert "DELETED 03 Greetings/06 I'm Fine" in (tmp_path / "reference_log.txt").read_text(encoding="utf-8")
+
+
+def test_delete_version_2_leaves_version_1_alone(refs, tmp_path):
+    r = next(x for x in refs if x.file_stem == "06 I'm Fine")
+    saved_video(r, refs, tmp_path, 1)
+    saved_video(r, refs, tmp_path, 2)
+
+    ref.delete_video(r, refs, tmp_path, version=2)
+
+    folder = tmp_path / "validation" / "03 Greetings"
+    assert (folder / "06 I'm Fine.mp4").exists() and (folder / "06 I'm Fine.gif").exists()
+    assert not (folder / "06 I'm Fine (2).mp4").exists() and not (folder / "06 I'm Fine (2).gif").exists()
+    assert list(ref.read_manifest(tmp_path)) == [("im_fine", 1)]
+
+
+def test_delete_that_windows_refuses_keeps_the_manifest_row(refs, tmp_path, monkeypatch):
+    r = next(x for x in refs if x.file_stem == "06 I'm Fine")
+    saved_video(r, refs, tmp_path)
+
+    def locked(self, missing_ok=False):
+        raise PermissionError("file is open in another program")
+    monkeypatch.setattr(Path, "unlink", locked)
+
+    with pytest.raises(OSError):
+        ref.delete_video(r, refs, tmp_path)
+    assert ("im_fine", 1) in ref.read_manifest(tmp_path)
+    assert "im_fine" in ref.done_ids(refs, tmp_path)

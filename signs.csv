@@ -95,6 +95,8 @@ alphabet,letter_k,K,15,1,0
 alphabet,letter_l,L,15,1,0
 alphabet,letter_m,M,15,1,0
 alphabet,letter_n,N,15,1,0
+alphabet,letter_enye,Ñ,15,1,0
+alphabet,letter_ng,NG,15,1,0
 alphabet,letter_o,O,15,1,0
 alphabet,letter_p,P,15,1,0
 alphabet,letter_q,Q,15,1,0

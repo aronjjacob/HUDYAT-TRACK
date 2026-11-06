@@ -24,7 +24,7 @@ project that reads this folder's `dataset/`.
 | `settings.json` | Remembered camera index, camera name and backend (created on first run). |
 | `public_mapping.csv` | Which FSL-105 label becomes which of our signs: `fsl105_id, fsl105_label, category, sign_id`. |
 | `assets/fonts/` | Poppins font (SIL Open Font License, see `OFL.txt`) used for the on-screen text. |
-| `signs.csv` | The sign list (108 rows). |
+| `signs.csv` | The sign list (110 rows). |
 | `hudyat_reference.py` | Reference mode (section 3.8): sign order, file names, MP4/GIF export, manifest and Google Form material. |
 | `references/` | Reference videos for the FSL expert validation (section 3.8), made with `record_tool.py --reference`. |
 | `tests/` | Unit tests: `python -m pytest`. |
@@ -196,8 +196,9 @@ Signers are **S1–S7**. Each signer records with their natural dominant hand
 is never recorded with this tool; it comes from `import_public.py`.
 
 Targets per signer (shown as progress everywhere): **15 takes** for each of
-each of the 108 signs: the 82 word signs and the 26 letters A–Z (category
-`alphabet`, sign ids `letter_a` … `letter_z`). Every signer records every
+each of the 110 signs: the 82 word signs and the 28 letters of the Filipino
+alphabet, A–Z plus Ñ and NG (category `alphabet`, sign ids `letter_a` …
+`letter_z`, `letter_enye`, `letter_ng`). Every signer records every
 category: 1,650 clips per signer.
 
 ### 3.2 The dashboard screens
@@ -325,7 +326,7 @@ replay it, and click **Flag: needs re-record**.
 ### 3.8 Reference videos (for the FSL expert validation)
 
 Before the signers record their takes, anyone who knows the signs records **one
-reference video per sign (all 108)**. The FSL validators check them in a
+reference video per sign (all 110)**. The FSL validators check them in a
 Google Form.
 
 ```powershell
@@ -337,7 +338,7 @@ python record_tool.py --reference --ref-seconds 5
    is asked; the hand is remembered and saved in the manifest.
 2. Like the dashboard, you first see one tile per category (`01 Alphabet` …
    `09 Word Concepts`) with its count (`3 / 10`) and a green tick when it is
-   complete; the total (`37 / 108`) is under the title. Click a category to
+   complete; the total (`37 / 110`) is under the title. Click a category to
    see its signs, each **done** or **pending**, and click a sign to record
    it. A blue outline marks the last category and sign used, and it is
    remembered for next time. On the recording screen the list on the right
@@ -349,7 +350,13 @@ python record_tool.py --reference --ref-seconds 5
    previous sign. A yellow warning appears if hands were found in less than
    80% of the sign window; keeping is still allowed.
 5. Recording a **done** sign again moves the old files to `references\_old\`
-   (with a timestamp) when the new take is kept. Nothing is deleted.
+   (with a timestamp) when the new take is kept. To watch a saved video, press
+   **W** (Preview). To remove one, press **D** (Delete) on the recording screen
+   or in Preview, and confirm: the video is **erased for good** (it does not go
+   to `_old`), and the sign is **pending** again, so you can retry it. If the
+   sign has two versions, you choose "Version 2 only" or "Both versions". This
+   only deletes files on this computer, so also remove any copy you already
+   uploaded to Google Drive.
 6. **Second version.** If a sign has another way of signing it, press **V**
    on a done sign to record it as version 2 (`<NN> <Sign Label> (2).mp4` /
    `.gif`, next to version 1, which is not touched). Only two versions per

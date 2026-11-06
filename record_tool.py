@@ -19,11 +19,13 @@ Optional command-line shortcuts:
         prints every camera index with its resolution and measured fps, then exits
     python record_tool.py --reference [--ref-seconds 4]
         Reference mode (also the "Reference videos" button on the dashboard):
-        one 4-second reference take per sign (all 108) for the FSL expert
+        one 4-second reference take per sign (all 110) for the FSL expert
         validation form. Saved under references/ (see hudyat_reference.py);
         dataset/ is never touched. Review keys: K keep, R redo, N next, B previous.
         V on a done sign records a second version (another way of signing it):
         "<NN> <Sign Label> (2).mp4"; the form then asks which version is correct.
+        W on a done sign previews the saved video. D permanently deletes it
+        (after asking), so the sign is pending again and can be retried.
 
 Keys on the recording screen (click the window first so it has keyboard focus):
     SPACE = start the 3-2-1 countdown and record one take
@@ -461,9 +463,9 @@ def take_quality(hand_counts: list[int], fps: float, sign: hc.Sign, expected_fra
 class TakePlayer:
     """Loops one saved clip at its own frame rate (read-only; never modifies it)."""
 
-    def __init__(self, row: dict[str, str]) -> None:
+    def __init__(self, row: dict[str, str], path: Path | None = None) -> None:
         self.row = row
-        self.path = hc.PROJECT_DIR / row.get("file_path", "")
+        self.path = path or hc.PROJECT_DIR / row.get("file_path", "")
         self.cap: cv2.VideoCapture | None = None
         self.frame: np.ndarray | None = None
         self.interval = 1 / hc.TARGET_FPS
@@ -539,6 +541,7 @@ class App:
         self.view_sign: hc.Sign | None = None            # TAKES / PLAYER
         self.take_rows: list[dict[str, str]] = []
         self.player: TakePlayer | None = None
+        self.ref_preview_version = 1                     # REF_PREVIEW: the version being shown
         self.scroll: dict[str, int] = {}                 # list name -> first visible row
         self.log: SessionLog | None = None
 
@@ -752,6 +755,61 @@ class App:
             self.set_message(f"Saved {stem} ({result.seconds:.1f} s · {gif}){old}", ui.SUCCESS)
         self.ref_step(1)
 
+    def open_ref_preview(self, version: int = 1) -> None:
+        """W: loop the saved video of the current sign (read-only)."""
+        r = self.current_ref
+        assert r is not None
+        self.close_player()
+        self.ref_preview_version = version
+        self.player = TakePlayer({}, ref.mp4_path(r, version=version))
+        self.screen = "REF_PREVIEW"
+
+    def close_ref_preview(self) -> None:
+        """Back to the recording screen. Not navigate(): that would end reference mode."""
+        self.close_player()
+        self.screen = "RECORD"
+
+    def handle_ref_preview_key(self, key: str) -> None:
+        """Preview keys: 1 / 2 switch version, D delete."""
+        sign = self.sign
+        if key == "d":
+            self.modal = "ref_delete"
+        elif key == "1" and self.ref_preview_version != 1:
+            self.open_ref_preview(1)
+        elif key == "2" and self.ref_preview_version != 2 and sign is not None and sign.sign_id in self.ref_v2:
+            self.open_ref_preview(2)
+
+    def ref_delete_action(self, action: str) -> None:
+        """Delete dialog. Version 2 goes first: version 1 is never removed without it,
+        since a version 2 needs a version 1."""
+        r = self.current_ref
+        assert r is not None
+        sign_id = r.sign.sign_id
+        has_v2 = sign_id in self.ref_v2
+        if action in ("refdelcancel", "back"):
+            self.modal = None
+            return
+        if action in ("refdel:all", "key:y"):
+            versions = (2, 1) if has_v2 else (1,)
+        elif action in ("refdel:2", "key:2") and has_v2:
+            versions = (2,)
+        else:
+            return
+        self.modal = None
+        if self.screen == "REF_PREVIEW":                 # Windows can't delete a file that is open
+            self.close_ref_preview()
+        try:
+            for version in versions:
+                ref.delete_video(r, self.refs, version=version)
+                (self.ref_done if version == 1 else self.ref_v2).discard(sign_id)
+        except OSError as exc:                           # the sign stays as it is on disk
+            self.set_message(f"Could not delete: {exc}. Close the video if it is open.", ui.DANGER)
+            ref.log(f"DELETE FAILED {r.file_stem}: {exc}")
+            return
+        what = "Version 2" if versions == (2,) else r.file_stem
+        self.set_message(f"Deleted {what}. Press SPACE to record again." if versions != (2,)
+                         else f"Deleted {what}. Version 1 stays.", ui.WARNING)
+
     # ----- navigation -------------------------------------------------------
     def select_signer(self, code: str) -> None:
         """Signer card clicked: ask the hand once if unknown, then show categories."""
@@ -883,6 +941,9 @@ class App:
         self.screen = screen
 
     def go_back(self) -> None:
+        if self.screen == "REF_PREVIEW":
+            self.close_ref_preview()
+            return
         back = {"RECORD": "REF_SIGNS" if self.ref_mode else "SIGNS", "PLAYER": "TAKES", "TAKES": "SIGNS",
                 "SIGNS": "CATEGORIES", "CATEGORIES": "HOME", "OVERVIEW": self.overview_return,
                 "REF_SIGNS": "REF_LIST", "REF_LIST": "HOME"}
@@ -1132,6 +1193,9 @@ class App:
         if self.modal == "ref_setup":
             self.ref_setup_action(action)
             return False
+        if self.modal == "ref_delete":
+            self.ref_delete_action(action)
+            return False
 
         kind, _, arg = action.partition(":")
         if action == "back":
@@ -1192,6 +1256,8 @@ class App:
                 self._chips_follow = False
         elif kind == "key" and self.screen == "RECORD":
             self.handle_record_key(arg)
+        elif kind == "key" and self.screen == "REF_PREVIEW":
+            self.handle_ref_preview_key(arg)
         elif kind == "key" and arg == "g":
             self.show_guides = not self.show_guides
         return False
@@ -1206,7 +1272,7 @@ class App:
 
     def handle_ref_key(self, key: str) -> None:
         """Reference mode keys: SPACE record, V record version 2; review K keep, R redo;
-        N next, B previous; P pause."""
+        N next, B previous; P pause; on a done sign W preview, D delete."""
         if self.state == "REVIEW":
             if key == "k":
                 self.keep_take()
@@ -1217,6 +1283,13 @@ class App:
             return
         if key in ("n", "b") and self.state in ("LIVE", "FINISHED"):
             self.ref_step(1 if key == "n" else -1)
+        elif key in ("w", "d") and self.state == "LIVE" and self.sign is not None:
+            if not self.is_complete(self.sign):
+                self.set_message("This sign has no saved video yet.", ui.WARNING)
+            elif key == "w":
+                self.open_ref_preview()
+            else:
+                self.modal = "ref_delete"
         elif key == "p" and self.state in ("LIVE", "COUNTDOWN"):
             self.paused = not self.paused
             self.state = "LIVE"
@@ -1312,17 +1385,21 @@ class App:
             canvas = self.render_record(frame)
         elif self.screen == "PLAYER":
             canvas = self.render_player()
+        elif self.screen == "REF_PREVIEW":
+            canvas = self.render_ref_preview()
         else:
             canvas = ui.backdrop(frame)
             {"HOME": self.draw_home, "CATEGORIES": self.draw_categories, "SIGNS": self.draw_signs,
              "TAKES": self.draw_takes, "OVERVIEW": self.draw_overview,
              "REF_LIST": self.draw_ref_list, "REF_SIGNS": self.draw_ref_signs}[self.screen](canvas)
             self.draw_notices(canvas, ui.UI_H - ui.MARGIN - 46)
-        if self.modal in ("hand", "ref_setup"):
+        if self.modal in ("hand", "ref_setup", "ref_delete"):
             self.hits.clear()                            # only the dialog is clickable
             self.scroll_regions.clear()
             if self.modal == "hand":
                 self.draw_hand_modal(canvas)
+            elif self.modal == "ref_delete":
+                self.draw_ref_delete(canvas)
             else:
                 self.draw_ref_setup(canvas)
                 self.draw_notices(canvas, ui.UI_H - ui.MARGIN - 46)
@@ -1803,6 +1880,71 @@ class App:
                        fg=ui.MUTED, bg_alpha=0.0)
         hint.draw(canvas, x + (w - hint.width) // 2, y + h - 32)
 
+    def draw_ref_delete(self, canvas: np.ndarray) -> None:
+        """Asked before a saved reference video is erased (it can't be undone)."""
+        r = self.current_ref
+        assert r is not None
+        two = r.sign.sign_id in self.ref_v2
+        ui.dim(canvas, 0.55)
+        w, h = 620, 300
+        x, y = (ui.UI_W - w) // 2, (ui.UI_H - h) // 2
+        ui.box(w, h, 24, ui.DARK, 0.92, outline=ui.WHITE, outline_alpha=0.25, texts=(
+            (w / 2, 48, f"Delete {r.title}?", 24, "semibold", ui.WHITE, 1.0, "mm"),
+            (w / 2, 84, "The video is erased for good. This can't be undone.", 14, "regular",
+             ui.MUTED, 1.0, "mm"))).draw(canvas, x, y)
+        buttons = [("Version 2 only", "refdel:2"), ("Both versions", "refdel:all")] if two \
+            else [("Delete", "refdel:all")]
+        bw, bh, gap = 250, 64, 40
+        total = len(buttons) * bw + (len(buttons) - 1) * gap
+        for i, (label, action) in enumerate(buttons):
+            bx = x + (w - total) // 2 + i * (bw + gap)
+            ui.box(bw, bh, bh // 2, ui.DANGER, 0.9, texts=(
+                (bw / 2, bh / 2, label, 18, "semibold", ui.WHITE, 1.0, "mm"),)).draw(canvas, bx, y + 120)
+            self.hits.add(bx, y + 120, bw, bh, action)
+        c = ui.pill("Cancel", 15, height=40, pad=18, bg_alpha=0.6)
+        cx = x + (w - c.width) // 2
+        c.draw(canvas, cx, y + h - 76)
+        self.hits.add(cx, y + h - 76, c.width, c.height, "refdelcancel")
+        hint = ui.pill("2 version 2 only  ·  Y both versions  ·  Esc cancel" if two else "Y delete  ·  Esc cancel",
+                       13, height=28, pad=12, fg=ui.MUTED, bg_alpha=0.0)
+        hint.draw(canvas, x + (w - hint.width) // 2, y + h - 32)
+
+    # ----- drawing: REF_PREVIEW (watch a saved reference video) ----------------------
+    def render_ref_preview(self) -> np.ndarray:
+        p, r = self.player, self.current_ref
+        assert r is not None
+        frame = p.current() if p is not None else None
+        if frame is not None:
+            canvas, _ = ui.compose_video(frame, mirror=False)   # saved as the camera sees the signer
+        else:
+            canvas, _ = ui.blank_canvas()
+            msg = ui.pill("Video file not found", 16, fg=ui.WARNING, height=44, pad=22)
+            msg.draw(canvas, (ui.UI_W - msg.width) // 2, ui.UI_H // 2)
+        m = ui.MARGIN
+        ui.round_button("back", 44).draw(canvas, m, m)
+        ui.key_badge("Esc").draw(canvas, m + 26, m + 30)
+        self.hits.add(m, m, 44, 44, "back")
+        two = r.sign.sign_id in self.ref_v2
+        label = f"{r.sign.sign_label.upper()} · VERSION {self.ref_preview_version}" if two \
+            else r.sign.sign_label.upper()
+        t = ui.title(label, ui.fit_title_size(label, TITLE_MAX_WIDTH, 52))
+        t.draw(canvas, m, m + 58)
+        buttons = [(ui.pill("Delete", 16, "semibold", ui.WHITE, ui.DANGER, 0.92, height=44, pad=18), "D", "key:d")]
+        if two:
+            other = 3 - self.ref_preview_version
+            buttons.insert(0, (ui.pill(f"Version {other}", 16, "medium", height=44, pad=18, bg_alpha=0.65),
+                               str(other), f"key:{other}"))
+        x, y = m, ui.UI_H - m - 28 - 12 - 44
+        for sprite, badge, action in buttons:
+            sprite.draw(canvas, x, y)
+            b = ui.key_badge(badge)
+            b.draw(canvas, x + sprite.width - b.width + 6, y - 8)
+            self.hits.add(x, y, sprite.width, sprite.height, action)
+            x += sprite.width + 12
+        cap_y = self.draw_caption(canvas, "Saved reference video  ·  D delete  ·  Esc back")
+        self.draw_notices(canvas, cap_y)
+        return canvas
+
     # ----- drawing: RECORD screen ---------------------------------------------------
     def render_record(self, frame: np.ndarray | None) -> np.ndarray:
         sign = self.sign
@@ -2045,7 +2187,7 @@ class App:
             if self.paused:
                 return "Paused — press P to resume"
             if sign is not None and self.is_complete(sign):
-                return "SPACE record again  ·  V record version 2  ·  N next sign  ·  B previous sign"
+                return "SPACE record again  ·  V version 2  ·  W preview  ·  D delete"
             return "SPACE record  ·  N next sign  ·  B previous sign"
         if self.state == "FINISHED":
             return "Click a sign on the right  ·  Esc back"
@@ -2089,12 +2231,15 @@ class App:
                  "P", "key:p", self.state in ("LIVE", "COUNTDOWN"))
         if self.ref_mode:                                 # N / B instead of Skip
             step_ok = self.state in ("LIVE", "REVIEW", "FINISHED")
+            saved = self.state == "LIVE" and sign is not None and self.is_complete(sign)
             buttons = [
                 record,
                 (ui.pill("Previous", 16, "medium", height=44, pad=18, bg_alpha=0.65), "B", "key:b", step_ok),
                 (ui.pill("Next", 16, "medium", height=44, pad=18, bg_alpha=0.65, icon="skip"), "N", "key:n",
                  step_ok and sign is not None),
                 pause,
+                (ui.pill("Preview", 16, "medium", height=44, pad=18, bg_alpha=0.65, icon="play"), "W", "key:w", saved),
+                (ui.pill("Delete", 16, "medium", height=44, pad=18, bg_alpha=0.65), "D", "key:d", saved),
             ]
         else:
             buttons = [

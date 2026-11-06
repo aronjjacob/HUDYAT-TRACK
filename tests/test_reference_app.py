@@ -154,3 +154,179 @@ def test_reference_mode_record_keep_next_previous(app):
     app.do("back")
     assert app.screen == "HOME" and not app.ref_mode
     assert dataset_snapshot() == before                           # dataset/ untouched
+
+
+# --- delete and preview of a saved video --------------------------------------------
+def open_sign(app, stem="01 Good Morning"):
+    """Reference mode, on the recording screen of one sign."""
+    app.do("reference")
+    app.do("refhand:right")
+    r = next(x for x in app.refs if x.file_stem == stem)
+    app.do(f"ref:{r.index}")
+    assert app.screen == "RECORD" and app.state == "LIVE"
+    return r
+
+
+def save_take(app, key=" "):
+    """Record and keep a take, then come back to the same sign (K moves to the next)."""
+    record_take(app, key)
+    app.do("key:k")
+    app.do("key:b")
+    assert app.sign.sign_id == "good_morning" and app.state == "LIVE"
+
+
+def greeting_files():
+    folder = ref.validation_dir() / "03 Greetings"
+    return {p.name for p in folder.iterdir()} if folder.exists() else set()
+
+
+V1 = {"01 Good Morning.mp4", "01 Good Morning.gif"}
+V2 = {"01 Good Morning (2).mp4", "01 Good Morning (2).gif"}
+
+
+def test_delete_on_a_sign_without_a_video_asks_nothing(app):
+    open_sign(app)
+    app.do("key:d")
+    assert app.modal is None
+
+
+def test_delete_is_ignored_while_a_take_waits_for_review(app):
+    open_sign(app)
+    record_take(app)
+    app.do("key:d")
+    assert app.modal is None and app.state == "REVIEW"
+
+
+def test_cancelling_the_delete_dialog_keeps_the_video(app):
+    open_sign(app)
+    save_take(app)
+    app.do("key:d")
+    assert app.modal == "ref_delete"
+    app.render(np.zeros((720, 1280, 3), np.uint8))
+    assert {a[4] for a in app.hits._areas} == {"refdel:all", "refdelcancel"}    # only the dialog is clickable
+    app.do("back")
+    assert app.modal is None and app.screen == "RECORD"
+    assert greeting_files() >= V1 and "good_morning" in app.ref_done
+
+
+def test_confirmed_delete_makes_the_sign_pending_and_it_can_be_recorded_again(app):
+    open_sign(app)
+    save_take(app)
+    app.do("key:d")
+    app.do("key:y")
+    assert app.modal is None and app.screen == "RECORD" and app.sign.sign_id == "good_morning"
+    assert not (greeting_files() & V1)
+    assert "good_morning" not in app.ref_done and not app.is_complete(app.sign)
+    assert ("good_morning", 1) not in ref.read_manifest()
+    save_take(app)                                                  # the retry
+    assert greeting_files() >= V1 and "good_morning" in app.ref_done
+
+
+def test_two_versions_dialog_deletes_version_2_only(app):
+    open_sign(app)
+    save_take(app)
+    save_take(app, "v")
+    app.do("key:d")
+    app.render(np.zeros((720, 1280, 3), np.uint8))
+    assert {a[4] for a in app.hits._areas} == {"refdel:2", "refdel:all", "refdelcancel"}
+    app.do("key:2")
+    assert greeting_files() >= V1 and not (greeting_files() & V2)
+    assert "good_morning" in app.ref_done and "good_morning" not in app.ref_v2
+
+
+def test_two_versions_dialog_deletes_both(app):
+    open_sign(app)
+    save_take(app)
+    save_take(app, "v")
+    app.do("key:d")
+    app.do("key:y")
+    assert not (greeting_files() & (V1 | V2))
+    assert "good_morning" not in app.ref_done and "good_morning" not in app.ref_v2
+
+
+def test_version_2_only_is_not_offered_for_a_sign_with_one_video(app):
+    open_sign(app)
+    save_take(app)
+    app.do("key:d")
+    app.do("key:2")
+    assert app.modal == "ref_delete" and greeting_files() >= V1
+
+
+def test_failed_delete_tells_the_user_and_keeps_the_sign_done(app, monkeypatch):
+    open_sign(app)
+    save_take(app)
+
+    def locked(*args, **kwargs):
+        raise PermissionError("file is open in another program")
+    monkeypatch.setattr(ref, "delete_video", locked)
+    app.do("key:d")
+    app.do("key:y")
+    assert app.modal is None and "Could not delete" in app.message
+    assert "good_morning" in app.ref_done
+
+
+def test_preview_needs_a_saved_video(app):
+    open_sign(app)
+    app.do("key:w")
+    assert app.screen == "RECORD" and app.player is None
+
+
+def test_preview_plays_the_saved_video_and_esc_stays_in_reference_mode(app):
+    open_sign(app)
+    save_take(app)
+    app.do("key:w")
+    assert app.screen == "REF_PREVIEW"
+    assert app.player.path.name == "01 Good Morning.mp4" and app.player.current() is not None
+    app.render(None)
+    player = app.player
+    app.do("back")
+    assert (app.screen, app.ref_mode, app.player) == ("RECORD", True, None)
+    assert player.cap is None                                       # file released
+    app.render(np.zeros((720, 1280, 3), np.uint8))
+
+
+def test_preview_switches_between_versions(app):
+    open_sign(app)
+    save_take(app)
+    app.do("key:w")
+    app.do("key:2")                                                 # no version 2 yet: stays on version 1
+    assert app.player.path.name == "01 Good Morning.mp4"
+    app.do("back")
+    save_take(app, "v")
+    app.do("key:w")
+    app.do("key:2")
+    assert app.player.path.name == "01 Good Morning (2).mp4" and app.player.current() is not None
+    app.render(None)
+    app.do("key:1")
+    assert app.player.path.name == "01 Good Morning.mp4"
+
+
+def test_cancelling_a_delete_from_preview_stays_in_preview(app):
+    open_sign(app)
+    save_take(app)
+    app.do("key:w")
+    app.do("key:d")
+    assert app.modal == "ref_delete"
+    app.render(None)
+    app.do("refdelcancel")
+    assert app.screen == "REF_PREVIEW" and app.player is not None
+
+
+def test_delete_from_preview_removes_the_open_file_and_returns_to_recording(app):
+    open_sign(app)
+    save_take(app)
+    app.do("key:w")
+    assert app.player.current() is not None                         # the file is really open
+    app.do("key:d")
+    app.do("key:y")
+    assert (app.screen, app.player) == ("RECORD", None)
+    assert not (greeting_files() & V1) and "good_morning" not in app.ref_done
+
+
+def test_delete_never_touches_the_dataset(app):
+    before = dataset_snapshot()
+    open_sign(app)
+    save_take(app)
+    app.do("key:d")
+    app.do("key:y")
+    assert dataset_snapshot() == before

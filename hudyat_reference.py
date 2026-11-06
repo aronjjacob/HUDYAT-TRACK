@@ -14,6 +14,7 @@ it can be tested on its own:
   * file names (clean_filename) and paths,
   * the export of a kept take: trimmed H.264 .mp4 + looping .gif (export_take),
   * archiving an older version before a sign is re-recorded (archive_old),
+  * permanently deleting a saved video (delete_video),
   * manifest.csv, form_list.md, build_validation_form.gs and FORM_SETUP.md.
 
 Everything is written under references/. Nothing here reads or writes dataset/.
@@ -23,7 +24,8 @@ Run  python hudyat_reference.py  to (re)write the form material without the came
     references/validation/<NN Category>/<NN> <Sign Label>.mp4   (and .gif)
     references/validation/<NN Category>/<NN> <Sign Label> (2).mp4   version 2, if recorded
     references/validation/manifest.csv, form_list.md, build_validation_form.gs, FORM_SETUP.md
-    references/_old/<NN Category>/<NN> <Sign Label> <timestamp>.mp4   earlier versions, never deleted
+    references/_old/<NN Category>/<NN> <Sign Label> <timestamp>.mp4   earlier versions of re-recorded
+                                signs, never deleted (a video erased with D is not kept here)
     references/_tmp/            the raw take while it waits for Keep / Redo
     references/reference_log.txt, reference_state.json
 """
@@ -45,7 +47,7 @@ import hudyat_common as hc
 # =============================================================================
 REF_DIR = hc.REFERENCES_DIR            # tests point this at a temporary folder
 REF_SECONDS = 4.0                      # length of a reference take (time-based); --ref-seconds
-EXPECTED_TOTAL = 108                   # stop if signs.csv does not give exactly this many signs
+EXPECTED_TOTAL = 110                  # stop if signs.csv does not give exactly this many signs
 TRIM_PAD_S = 0.3                       # kept before / after the sign window (hudyat_common.sign_window)
 MP4_SIZE = (1280, 720)
 MP4_CRF = 20                           # H.264 quality (lower = better, bigger)
@@ -66,7 +68,7 @@ CATEGORY_FOLDERS: list[tuple[str, tuple[str, ...]]] = [
     ("08 WH-Questions", ("wh_questions",)),
     ("09 Word Concepts", ("word_concepts",)),
 ]
-ALPHABET_FOLDER = "01 Alphabet"        # merged letters are sorted A to Z
+ALPHABET_FOLDER = "01 Alphabet"        # merged letters are sorted A to Z, then Ñ, NG (signs.csv order)
 SKIP = ("none",)                       # the "none" row (category or sign_id) is not a sign
 
 MANIFEST_FIELDS = [
@@ -121,6 +123,14 @@ def clean_filename(label: str) -> str:
     return name.rstrip(" .") or "_"
 
 
+def _alphabet_key(s: hc.Sign) -> tuple:
+    """Single letters A-Z sort alphabetically; anything else (Ñ, NG) keeps its order after Z."""
+    label = s.sign_label.upper()
+    if len(label) == 1 and "A" <= label <= "Z":
+        return (0, label)
+    return (1,)
+
+
 def reference_signs(signs: list[hc.Sign]) -> list[RefSign]:
     """All signs in form order, numbered within their folder.
 
@@ -138,7 +148,9 @@ def reference_signs(signs: list[hc.Sign]) -> list[RefSign]:
         buckets[folder_of[s.category]].append(s)
     if unknown:
         raise ValueError(f"signs.csv has signs in unknown categories: {', '.join(unknown)}")
-    buckets[ALPHABET_FOLDER].sort(key=lambda s: s.sign_label.upper())
+    # A-Z first (keeps the recorded "01 A" .. "26 Z" numbers), then the Filipino
+    # extras (Ñ, NG) in signs.csv order as 27, 28.
+    buckets[ALPHABET_FOLDER].sort(key=_alphabet_key)
     out: list[RefSign] = []
     for folder, _ in CATEGORY_FOLDERS:
         for no, s in enumerate(buckets[folder], start=1):
@@ -418,6 +430,24 @@ def done_ids(refs: list[RefSign], base: Path | None = None) -> set[str]:
 def version2_ids(refs: list[RefSign], base: Path | None = None) -> set[str]:
     """Signs that also have a second version."""
     return recorded_ids(refs, 2, base)
+
+
+# =============================================================================
+# DELETE: erase a saved video for good (D in the recorder)
+# =============================================================================
+def delete_video(r: RefSign, refs: list[RefSign], base: Path | None = None, version: int = 1) -> None:
+    """Permanently erase this version's .mp4 / .gif (not moved to references/_old).
+
+    The files go first: if Windows refuses (the video is open in a player), the
+    OSError is raised with the manifest unchanged, and calling this again finishes.
+    """
+    mp4_path(r, base, version).unlink(missing_ok=True)
+    gif_path(r, base, version).unlink(missing_ok=True)
+    rows = read_manifest(base)
+    rows.pop((r.sign.sign_id, version), None)
+    write_manifest(rows, refs, base)
+    write_form_files(refs, base)
+    log(f"DELETED {r.folder}/{version_stem(r, version)}", base)
 
 
 # =============================================================================
